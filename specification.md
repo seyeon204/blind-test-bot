@@ -102,9 +102,15 @@ ParsedSpec
 - **`individual_tests`**: 엔드포인트별 TC 목록 초안 (happy path, auth_bypass, SQL injection 등)
 - **`scenarios`**: 여러 엔드포인트를 연결하는 통합 시나리오 (POST → GET → DELETE 같은 CRUD 플로우)
 
-대용량 스펙 처리:
-- 25개 이하: 단일 Claude 호출로 individual_tests + scenarios 동시 수립
-- 26개 이상: individual_tests는 25개씩 배치 순차 처리, scenarios는 전체 스펙으로 별도 호출
+Phase 1은 항상 4개의 독립적인 Claude 호출로 구성된다 (순차 실행):
+1. **individual_tests 배치** — 25개씩 묶어 배치 처리 (대용량 스펙 대응)
+2. **CRUD 시나리오** — 전체 스펙으로 단일 호출. 단일 도메인 흐름 식별 (CRUD lifecycle, 인증 흐름)
+3. **도메인 분석** — 전체 스펙으로 단일 호출. API를 비즈니스 도메인으로 분해
+4. **비즈니스 시나리오** — 도메인 맵 기반 단일 호출. 크로스 도메인 통합 시나리오 생성
+
+시나리오 타입:
+- `crud` — 단일 도메인 CRUD 흐름, 인증 플로우, 의존성 체인
+- `business` — 복수 도메인을 가로지르는 실제 비즈니스 트랜잭션 (e.g. KYC → 계좌개설 → 주문 → 정산)
 
 결과 조회: `GET /test-runs/{run_id}/plan?method=GET&path=/users`
 
@@ -477,7 +483,9 @@ error_disclosure    → 500인데 stack trace 없으면 PASS
   201 / 202 / 204 모두 2xx 성공으로 인정
 ```
 
-타임아웃(`ai_validate_timeout_seconds`, 기본 600초) 초과 또는 Claude 오류 시 → 자동으로 하휴리스틱 fallback.
+타임아웃(`ai_validate_timeout_seconds`, 기본 120초) 초과 또는 Claude 오류 시 → 자동으로 휴리스틱 fallback.
+
+**Adaptive Thinking**: `claude_tc_model`이 Sonnet 4.6 / Opus 4.x 계열이면 `thinking: {type: "adaptive"}`를 활성화해 복잡한 보안 판정에 추론 단계를 더한다.
 
 ### 7-2. 휴리스틱 검증 (fallback)
 
@@ -566,9 +574,12 @@ debug, secret, password, private_key
 
 ### Rate Limiting
 ```
-_rate_lock + _last_call_time으로 전역 직렬화
-최소 간격 = 60 / ANTHROPIC_RPM 초 (기본 RPM=40 → 1.5초 간격)
-429/529 재시도: 60*(attempt+1) + random(0,15)초 대기, 최대 5회
+슬라이딩 윈도우(_call_times deque)로 전역 직렬화
+최소 간격 = 60초 윈도우 내 호출 수 < ANTHROPIC_RPM 유지 (기본 RPM=40)
+
+재시도 (최대 5회):
+  429 RateLimitError    → min(30 * 2^attempt, 300) + random(0,10)초 대기
+  529 InternalServerError → min(15 * 2^attempt, 120) + random(0, 5)초 대기
 ```
 
 ### Mock 모드
@@ -591,7 +602,7 @@ _rate_lock + _last_call_time으로 전역 직렬화
 | `MAX_CONCURRENT_REQUESTS` | `10` | 동시 httpx 요청 수 |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | 요청당 타임아웃(초) |
 | `RUN_TTL_HOURS` | `24` | 완료 런 메모리 보존 시간 |
-| `AI_VALIDATE_TIMEOUT_SECONDS` | `600` | AI 검증 타임아웃(초) |
+| `AI_VALIDATE_TIMEOUT_SECONDS` | `120` | AI 검증 타임아웃(초) |
 | `MAX_RESPONSE_BODY_BYTES` | `10240` | 응답 바디 최대 저장 크기 (10KB) |
 | `MODEL_INPUT_PRICE_PER_MTOK` | `0.80` | 입력 토큰 단가 ($/1M, Haiku 기준) |
 | `MODEL_OUTPUT_PRICE_PER_MTOK` | `4.00` | 출력 토큰 단가 ($/1M) |
