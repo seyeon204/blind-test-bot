@@ -16,9 +16,12 @@ class TestRunSummary(BaseModel):
     passed: int
     failed: int
     skipped: int
-    scenario_total: int = 0
-    scenario_passed: int = 0
-    scenario_failed: int = 0
+    crud_scenario_total: int = 0
+    crud_scenario_passed: int = 0
+    crud_scenario_failed: int = 0
+    business_scenario_total: int = 0
+    business_scenario_passed: int = 0
+    business_scenario_failed: int = 0
     avg_latency_ms: float = 0.0
 
 
@@ -143,11 +146,13 @@ class TestRunStatusResponse(BaseModel):
     endpoints: list[EndpointSummary] = []
     # Step 2: generate
     test_case_count: int = 0
-    scenario_count: int = 0
+    crud_scenario_count: int = 0
+    business_scenario_count: int = 0
     skipped_endpoints: list[str] = []
     # Step 3: execute
     summary: Optional[TestRunSummary] = None
     results: list[TestCaseResultResponse] = []
-    scenario_results: list[ScenarioResultResponse] = []
+    crud_scenario_results: list[ScenarioResultResponse] = []
+    business_scenario_results: list[ScenarioResultResponse] = []
     vulnerabilities: list[Vulnerability] = []
     estimated_cost_usd: float = 0.0

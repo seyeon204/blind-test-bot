@@ -637,8 +637,6 @@ async def plan_test_cases(
         for ep in individual_raw
     ]
 
-    all_scenarios = crud_scenarios + business_scenarios
-
     if n > 0 and not individual_tests:
         logger.warning(
             "[tc_planner] 0 individual_tests returned for %d endpoints — "
@@ -649,4 +647,8 @@ async def plan_test_cases(
         "[tc_planner] Plan: %d endpoints, %d crud scenarios, %d business scenarios",
         len(individual_tests), len(crud_scenarios), len(business_scenarios),
     )
-    return TestPlan(individual_tests=individual_tests, scenarios=all_scenarios)
+    return TestPlan(
+        individual_tests=individual_tests,
+        crud_scenarios=crud_scenarios,
+        business_scenarios=business_scenarios,
+    )

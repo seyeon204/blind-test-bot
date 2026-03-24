@@ -35,7 +35,8 @@ def reset_orchestrator():
     test_orchestrator._test_cases_internal.clear()
     test_orchestrator._run_logs.clear()
     test_orchestrator._tasks.clear()
-    test_orchestrator._scenarios_internal.clear()
+    test_orchestrator._crud_scenarios_internal.clear()
+    test_orchestrator._business_scenarios_internal.clear()
 
 
 # ---------------------------------------------------------------------------

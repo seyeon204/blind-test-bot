@@ -110,9 +110,9 @@ async def test_plan_returns_scenarios():
     with patch("app.core.tc_planner.chat_with_tools", new=AsyncMock(return_value=response)):
         plan = await plan_test_cases(spec)
 
-    assert len(plan.scenarios) == 1
-    assert plan.scenarios[0].name == "Create and fetch user"
-    assert plan.scenarios[0].steps == ["POST /users", "GET /users/{id}"]
+    assert len(plan.crud_scenarios) == 1
+    assert plan.crud_scenarios[0].name == "Create and fetch user"
+    assert plan.crud_scenarios[0].steps == ["POST /users", "GET /users/{id}"]
 
 
 @pytest.mark.asyncio
@@ -133,7 +133,7 @@ async def test_scenario_auto_generated_id():
     with patch("app.core.tc_planner.chat_with_tools", new=AsyncMock(return_value=response)):
         plan = await plan_test_cases(spec)
 
-    assert plan.scenarios[0].id  # non-empty UUID string
+    assert plan.crud_scenarios[0].id  # non-empty UUID string
 
 
 @pytest.mark.asyncio
@@ -146,7 +146,8 @@ async def test_plan_empty_scenarios():
     with patch("app.core.tc_planner.chat_with_tools", new=AsyncMock(return_value=response)):
         plan = await plan_test_cases(spec)
 
-    assert plan.scenarios == []
+    assert plan.crud_scenarios == []
+    assert plan.business_scenarios == []
 
 
 @pytest.mark.asyncio
@@ -184,7 +185,8 @@ async def test_claude_exception_returns_empty_plan():
     with patch("app.core.tc_planner.chat_with_tools", new=AsyncMock(side_effect=RuntimeError("API down"))):
         plan = await plan_test_cases(spec)
     assert plan.individual_tests == []
-    assert plan.scenarios == []
+    assert plan.crud_scenarios == []
+    assert plan.business_scenarios == []
 
 
 @pytest.mark.asyncio
@@ -197,7 +199,8 @@ async def test_no_tool_use_block_returns_empty_plan():
     with patch("app.core.tc_planner.chat_with_tools", new=AsyncMock(return_value=text_response)):
         plan = await plan_test_cases(spec)
     assert plan.individual_tests == []
-    assert plan.scenarios == []
+    assert plan.crud_scenarios == []
+    assert plan.business_scenarios == []
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +228,7 @@ async def test_crud_scenarios_tagged():
     with patch("app.core.tc_planner.chat_with_tools", new=AsyncMock(return_value=crud_response)):
         plan = await plan_test_cases(spec)
 
-    crud = [s for s in plan.scenarios if s.scenario_type == "crud"]
+    crud = plan.crud_scenarios
     assert len(crud) == 1
     assert crud[0].name == "Create and fetch"
 
@@ -273,7 +276,7 @@ async def test_business_scenarios_tagged_with_domains():
     with patch("app.core.tc_planner.chat_with_tools", new=AsyncMock(side_effect=make_side_effect())):
         plan = await plan_test_cases(spec)
 
-    business = [s for s in plan.scenarios if s.scenario_type == "business"]
+    business = plan.business_scenarios
     assert len(business) == 1
     assert business[0].name == "Order to settlement"
     assert business[0].domains == ["order", "settlement"]

@@ -100,17 +100,14 @@ ParsedSpec
 
 출력 — `TestPlan`:
 - **`individual_tests`**: 엔드포인트별 TC 목록 초안 (happy path, auth_bypass, SQL injection 등)
-- **`scenarios`**: 여러 엔드포인트를 연결하는 통합 시나리오 (POST → GET → DELETE 같은 CRUD 플로우)
+- **`crud_scenarios`**: 단일 도메인 통합 시나리오 (CRUD lifecycle, 인증 플로우, 의존성 체인)
+- **`business_scenarios`**: 복수 도메인을 가로지르는 실제 비즈니스 트랜잭션 (e.g. KYC → 계좌개설 → 주문 → 정산)
 
 Phase 1은 항상 4개의 독립적인 Claude 호출로 구성된다 (순차 실행):
 1. **individual_tests 배치** — 25개씩 묶어 배치 처리 (대용량 스펙 대응)
 2. **CRUD 시나리오** — 전체 스펙으로 단일 호출. 단일 도메인 흐름 식별 (CRUD lifecycle, 인증 흐름)
 3. **도메인 분석** — 전체 스펙으로 단일 호출. API를 비즈니스 도메인으로 분해
 4. **비즈니스 시나리오** — 도메인 맵 기반 단일 호출. 크로스 도메인 통합 시나리오 생성
-
-시나리오 타입:
-- `crud` — 단일 도메인 CRUD 흐름, 인증 플로우, 의존성 체인
-- `business` — 복수 도메인을 가로지르는 실제 비즈니스 트랜잭션 (e.g. KYC → 계좌개설 → 주문 → 정산)
 
 결과 조회: `GET /test-runs/{run_id}/plan?method=GET&path=/users`
 
@@ -134,7 +131,8 @@ Phase 1 계획을 체크리스트로 활용해서 실제 TC를 생성한다.
 ### Phase 2b: Generate — 시나리오 TC 생성 (`generating`)
 **파일**: `tc_generator.py` → `generate_scenario_test_cases()`
 
-Phase 1의 `scenarios` 목록을 받아 시나리오 단계별 TC를 생성한다.
+Phase 1의 `crud_scenarios`와 `business_scenarios`를 **동시에(병렬로)** 받아 시나리오 단계별 TC를 생성한다.
+두 트랙이 `asyncio.gather`로 병렬 실행되므로 시나리오 수가 많아도 생성 시간이 단축된다.
 
 예시: "회원가입 → 로그인 → 보호된 리소스 접근" 시나리오
 ```
@@ -154,9 +152,22 @@ Step 3: GET  /profile/{id}   → 200  (token 자동 주입)
   - 보안 TC와 일반 TC를 분리해서 별도 Claude 호출 (판정 기준이 반대라 혼용 방지)
   - Claude 호출 실패 시 heuristic validator로 자동 폴백
 
-**시나리오 TC 실행**:
-- 순서대로 실행, 앞 단계 응답값을 JSONPath로 추출해 다음 단계 파라미터에 주입
-- 한 step이 실패하면 나머지 steps는 스킵
+**시나리오 TC 실행** (단일도메인 + 크로스도메인 병렬):
+```
+개별 TC 실행 완료
+        ↓
+  asyncio.gather(
+    _run_scenario_list(crud_scenarios),      ← 단일도메인 순차 실행
+    _run_scenario_list(business_scenarios),  ← 크로스도메인 순차 실행
+  )
+```
+- 각 트랙 내부는 **순차 실행** (앞 단계 응답값을 다음 단계에 주입해야 하므로)
+- 두 트랙은 **서로 독립적이므로 병렬**로 실행
+- 한 step이 실패하면 해당 시나리오의 나머지 steps만 스킵
+
+결과는 트랙별로 분리되어 저장된다:
+- `crud_scenario_results` — 단일도메인 시나리오 결과
+- `business_scenario_results` — 크로스도메인 시나리오 결과
 
 결과 조회: `GET /test-runs/{run_id}/results` (`validation_mode: "ai" | "heuristic"` 필드로 판정 방식 확인 가능)
 
@@ -222,10 +233,29 @@ GET /test-runs/{run_id}/estimate    # 비용 예측 (claude 모드)
 결과 조회 파라미터:
 ```
 GET /test-runs/{run_id}/results
-  ?passed=true            # 통과한 TC만
-  ?passed=false           # 실패한 TC만
-  ?page=1&page_size=100   # 페이지네이션
-  ?format=junit           # JUnit XML 포맷 다운로드
+  ?passed=true            # 통과한 개별 TC만
+  ?passed=false           # 실패한 개별 TC만
+  ?track=individual       # 개별 TC 결과만 (기본: 전체 포함)
+  ?track=crud             # 단일도메인 시나리오 결과만
+  ?track=business         # 크로스도메인 시나리오 결과만
+  ?page=1&page_size=100   # 페이지네이션 (개별 TC 대상)
+  ?format=junit           # JUnit XML 포맷 다운로드 (개별 TC 대상)
+```
+
+응답 구조:
+```json
+{
+  "status": "completed",
+  "total_summary": {
+    "individual": { "total": N, "passed": N, "failed": N },
+    "crud":       { "total": N, "passed": N, "failed": N },
+    "business":   { "total": N, "passed": N, "failed": N }
+  },
+  "result_count": N,
+  "results": [...],                    // 개별 TC 결과 (페이지네이션 적용)
+  "crud_scenario_results": [...],      // 단일도메인 시나리오 결과
+  "business_scenario_results": [...]   // 크로스도메인 시나리오 결과
+}
 ```
 
 ---
@@ -255,14 +285,23 @@ variables_file: <vars.json>      (선택 — Postman 변수 치환)
 
 풀런 내부 흐름:
 ```
-_parse_pipeline()          # Phase 0: 스펙 파싱
+_parse_pipeline()                    # Phase 0: 스펙 파싱
     ↓
-_generate_pipeline()       # Phase 1 (Analyze) + Phase 2a/2b (Generate)
-    ├── plan_test_cases()  # Claude 모드: tc_planner → TestPlan
-    ├── generate_test_cases()        # 엔드포인트별 TC 생성 (배치)
-    └── generate_scenario_test_cases()  # 시나리오 TC 생성
+_generate_pipeline()                 # Phase 1 (Analyze) + Phase 2a/2b (Generate)
+    ├── plan_test_cases()            # Claude 모드: tc_planner
+    │     → TestPlan(individual_tests, crud_scenarios, business_scenarios)
+    ├── generate_test_cases()        # Phase 2a: 엔드포인트별 개별 TC 생성 (배치)
+    └── asyncio.gather(              # Phase 2b: 시나리오 TC 병렬 생성
+          generate_scenario_test_cases(crud_scenarios),
+          generate_scenario_test_cases(business_scenarios),
+        )
     ↓
-_execute_pipeline()        # Phase 3: 실행 + AI 검증
+_execute_pipeline()                  # Phase 3: 실행 + AI 검증
+    ├── 개별 TC 청크 실행
+    └── asyncio.gather(              # 시나리오 병렬 실행
+          _run_scenario_list(crud_scenarios),
+          _run_scenario_list(business_scenarios),
+        )
 ```
 
 파싱 → 생성 → 실행을 **순차적으로** 처리한다. 각 단계가 완전히 끝난 후 다음 단계로 넘어간다.
@@ -392,8 +431,17 @@ Phase 1 플랜을 가이드라인 삼아 Claude Haiku가 실제 TC 값을 채운
 Claude 실패 시 해당 배치는 **자동으로 Local 모드로 fallback**.
 
 #### Phase 2b: 시나리오 TC 생성 (tc_generator.py)
-Phase 1에서 식별된 통합 시나리오를 실제 스텝 시퀀스로 변환한다.
+Phase 1의 `crud_scenarios`와 `business_scenarios`를 각각 실제 스텝 시퀀스로 변환한다.
+두 트랙이 `asyncio.gather`로 **병렬 생성**된다.
 
+```
+asyncio.gather(
+  generate_scenario_test_cases(plan.crud_scenarios, ...),     → _crud_scenarios_internal
+  generate_scenario_test_cases(plan.business_scenarios, ...),  → _business_scenarios_internal
+)
+```
+
+변환 예시:
 ```
 PlannedScenario: ["POST /users", "GET /users/{id}", "DELETE /users/{id}"]
   ↓
@@ -451,7 +499,17 @@ Content-Type: image/*, application/pdf, application/octet-*
 ```
 
 ### 시나리오 실행
-시나리오는 **순차 실행**이다. 앞 스텝에서 추출한 값을 `context`에 쌓고 다음 스텝의 `{{varName}}` 템플릿에 주입한다. 중간에 `network_error` 발생 시 이후 스텝은 건너뛴다.
+실행 순서: **개별 TC 완료 → crud 트랙과 business 트랙을 병렬 실행**
+
+```
+1. 개별 TC 청크 실행 (동시, 세마포어 제한)
+2. asyncio.gather(
+     _run_scenario_list(crud_scenarios),     ← 트랙 내부는 순차
+     _run_scenario_list(business_scenarios),  ← 트랙 내부는 순차
+   )
+```
+
+각 트랙 내부는 순차 실행이다. 앞 스텝에서 추출한 값을 `context`에 쌓고 다음 스텝의 `{{varName}}` 템플릿에 주입한다. 중간에 `network_error` 발생 시 이후 스텝은 건너뛴다.
 
 ### Rate Limit TC 실행
 `repeat_count > 1`인 TC (rate_limit 타입)는 동일 요청을 N번 연속으로 보내서, 그 중 하나라도 429를 받으면 PASS로 처리한다.
@@ -552,7 +610,7 @@ debug, secret, password, private_key
 
   실패:   failed    (어느 단계에서든)
   취소:   cancelled (task.cancel())
-  풀런:   running   (generate + execute 동시 진행 중)
+  풀런:   running   (generate + execute 순차 진행 중)
 ```
 
 완료/실패/취소된 런은 `run_ttl_hours`(기본 24시간) 이후 메모리에서 자동 GC.

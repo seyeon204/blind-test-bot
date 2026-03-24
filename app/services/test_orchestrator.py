@@ -45,8 +45,10 @@ _tasks: dict[str, asyncio.Task] = {}
 _specs: dict[str, ParsedSpec] = {}
 # run_id → TestPlan (Phase 1 output, queryable via GET /plan)
 _plans: dict[str, TestPlan] = {}
-# run_id → list[TestScenario] (kept for execution)
-_scenarios_internal: dict[str, list[TestScenario]] = {}
+# run_id → list[TestScenario] for single-domain CRUD scenarios (kept for execution)
+_crud_scenarios_internal: dict[str, list[TestScenario]] = {}
+# run_id → list[TestScenario] for cross-domain business scenarios (kept for execution)
+_business_scenarios_internal: dict[str, list[TestScenario]] = {}
 # run_id → list[TestCase] (kept for step 3)
 _test_cases_internal: dict[str, list[TestCase]] = {}
 # run_id → list[GeneratedTestCase] (response model, queryable)
@@ -118,12 +120,14 @@ def get_plan(
     if not plan:
         return None
 
-    scenarios = plan.scenarios
-    if scenario_type:
-        # Scenario-only query: suppress individual_tests to keep the response focused
-        scenarios = [s for s in scenarios if s.scenario_type == scenario_type]
+    if scenario_type == "crud":
+        scenarios = plan.crud_scenarios
+        endpoints = []
+    elif scenario_type == "business":
+        scenarios = plan.business_scenarios
         endpoints = []
     else:
+        scenarios = plan.crud_scenarios + plan.business_scenarios
         endpoints = plan.individual_tests
         if method:
             endpoints = [ep for ep in endpoints if ep.method.upper() == method.upper()]
@@ -156,8 +160,8 @@ def get_plan(
         for s in scenarios
     ]
 
-    crud_count = sum(1 for s in plan.scenarios if s.scenario_type == "crud")
-    business_count = sum(1 for s in plan.scenarios if s.scenario_type == "business")
+    crud_count = len(plan.crud_scenarios)
+    business_count = len(plan.business_scenarios)
 
     return TestPlanResponse(
         total_endpoints=len(plan.individual_tests),
@@ -239,7 +243,8 @@ async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: b
 
         _test_cases[run_id] = []
         _test_cases_internal[run_id] = []
-        _scenarios_internal[run_id] = []
+        _crud_scenarios_internal[run_id] = []
+        _business_scenarios_internal[run_id] = []
 
         # ── Phase 1: Analyze (claude mode only) ──────────────────────────────
         plan_by_endpoint = None
@@ -249,11 +254,8 @@ async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: b
             try:
                 plan = await plan_test_cases(spec)
                 _plans[run_id] = plan
-                _store[run_id] = _store[run_id].model_copy(update={
-                    "scenario_count": len(plan.scenarios),
-                })
                 plan_by_endpoint = {f"{ep.method} {ep.path}": ep for ep in plan.individual_tests}
-                _log(run_id, f"Plan ready: {len(plan.individual_tests)} endpoints, {len(plan.scenarios)} scenarios")
+                _log(run_id, f"Plan ready: {len(plan.individual_tests)} endpoints, {len(plan.crud_scenarios)} crud + {len(plan.business_scenarios)} business scenarios")
             except Exception as e:
                 _log(run_id, f"Planning failed ({e}), falling back to unguided generation")
                 plan = None
@@ -312,25 +314,42 @@ async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: b
                 "estimated_cost_usd": _store[run_id].estimated_cost_usd + cost,
             })
 
-        # ── Phase 2b: Scenario TC generation (claude mode only) ──────────────
+        # ── Phase 2b: Scenario TC generation (claude mode only, parallel) ────
         plan = _plans.get(run_id)
-        if config.generator == GeneratorType.claude and plan and plan.scenarios:
-            _log(run_id, f"Phase 2b: Generating {len(plan.scenarios)} integration scenarios…")
+        if config.generator == GeneratorType.claude and plan and (plan.crud_scenarios or plan.business_scenarios):
+            crud_count = len(plan.crud_scenarios)
+            biz_count = len(plan.business_scenarios)
+            _log(run_id, f"Phase 2b: Generating {crud_count} crud + {biz_count} business scenarios (parallel)…")
             try:
-                scenarios = await generate_scenario_test_cases(
-                    plan.scenarios,
-                    spec,
-                    auth_headers=config.auth_headers,
+                crud_gen, business_gen = await asyncio.gather(
+                    generate_scenario_test_cases(plan.crud_scenarios, spec, auth_headers=config.auth_headers),
+                    generate_scenario_test_cases(plan.business_scenarios, spec, auth_headers=config.auth_headers),
+                    return_exceptions=True,
                 )
-                _scenarios_internal[run_id] = scenarios
+                if not isinstance(crud_gen, Exception):
+                    _crud_scenarios_internal[run_id] = crud_gen
+                else:
+                    _log(run_id, f"CRUD scenario generation failed ({crud_gen}), continuing without crud scenarios")
+                if not isinstance(business_gen, Exception):
+                    _business_scenarios_internal[run_id] = business_gen
+                else:
+                    _log(run_id, f"Business scenario generation failed ({business_gen}), continuing without business scenarios")
                 _store[run_id] = _store[run_id].model_copy(update={
-                    "scenario_count": len(scenarios),
+                    "crud_scenario_count": len(_crud_scenarios_internal[run_id]),
+                    "business_scenario_count": len(_business_scenarios_internal[run_id]),
                 })
-                _log(run_id, f"Scenarios ready: {len(scenarios)} with {sum(len(s.steps) for s in scenarios)} steps total")
+                total_scenarios = len(_crud_scenarios_internal[run_id]) + len(_business_scenarios_internal[run_id])
+                total_steps = (
+                    sum(len(s.steps) for s in _crud_scenarios_internal[run_id])
+                    + sum(len(s.steps) for s in _business_scenarios_internal[run_id])
+                )
+                _log(run_id, f"Scenarios ready: {total_scenarios} with {total_steps} steps total")
             except Exception as e:
                 _log(run_id, f"Scenario generation failed ({e}), continuing without scenarios")
 
-        _log(run_id, f"Generation complete: {len(all_cases)} TCs + {len(_scenarios_internal.get(run_id, []))} scenarios")
+        total_crud = len(_crud_scenarios_internal.get(run_id, []))
+        total_biz = len(_business_scenarios_internal.get(run_id, []))
+        _log(run_id, f"Generation complete: {len(all_cases)} TCs + {total_crud} crud + {total_biz} business scenarios")
         _store[run_id] = _store[run_id].model_copy(update={
             "status": "generated",
             "test_case_count": len(all_cases),
@@ -344,6 +363,70 @@ async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: b
 def start_generate(run_id: str, config: GenerateConfig) -> None:
     task = asyncio.create_task(_generate_pipeline(run_id, config))
     _tasks[run_id] = task
+
+
+# ── scenario execution helper ─────────────────────────────────────────────────
+
+async def _run_scenario_list(
+    scenarios: list[TestScenario],
+    run_id: str,
+    base_url: str,
+    config: ExecuteConfig,
+) -> list[ScenarioResultResponse]:
+    """Execute a list of scenarios sequentially, returning ScenarioResultResponse list."""
+    results: list[ScenarioResultResponse] = []
+    for scenario in scenarios:
+        _log(run_id, f"[scenario] Running '{scenario.name}' ({len(scenario.steps)} steps)…")
+        try:
+            step_tuples = await execute_scenario(scenario, base_url=base_url, timeout=config.timeout_seconds)
+        except Exception as e:
+            _log(run_id, f"[scenario] '{scenario.name}' execution error: {e}")
+            continue
+
+        step_tcs = [t for t, _, _ in step_tuples]
+        step_execs = [e for _, e, _ in step_tuples]
+        step_validations = await ai_validate_batch(step_tcs, step_execs)
+        val_map = {v.test_case_id: v for v in step_validations}
+
+        step_results: list[ScenarioStepResult] = []
+        for (resolved_tc, execution, extracted) in step_tuples:
+            validation = val_map.get(resolved_tc.id) or validate_result(resolved_tc, execution)
+            step_results.append(ScenarioStepResult(
+                step_index=resolved_tc.step_index or 0,
+                test_case_id=resolved_tc.id,
+                endpoint=f"{resolved_tc.endpoint_method} {resolved_tc.endpoint_path}",
+                description=resolved_tc.description,
+                passed=validation.passed,
+                request={
+                    "method": resolved_tc.endpoint_method,
+                    "path": resolved_tc.endpoint_path,
+                    "path_params": resolved_tc.path_params,
+                    "query_params": resolved_tc.query_params,
+                    "headers": resolved_tc.headers,
+                    "body": resolved_tc.body,
+                },
+                response={
+                    "status_code": execution.status_code,
+                    "body": execution.response_body,
+                    "latency_ms": execution.latency_ms,
+                    "network_error": execution.network_error,
+                },
+                failures=validation.failures,
+                extracted_values=extracted,
+            ))
+            status_str = str(execution.status_code) if execution.status_code else f"ERR:{execution.network_error}"
+            result_str = "PASS" if validation.passed else f"FAIL({', '.join(validation.failures)})"
+            _log(run_id, f"[scenario:{scenario.name}] step{resolved_tc.step_index} {resolved_tc.endpoint_method} {resolved_tc.endpoint_path} → {status_str} {result_str}")
+
+        scenario_passed = all(s.passed for s in step_results)
+        results.append(ScenarioResultResponse(
+            scenario_id=scenario.id,
+            name=scenario.name,
+            description=scenario.description,
+            passed=scenario_passed,
+            steps=step_results,
+        ))
+    return results
 
 
 # ── step 3: execute ───────────────────────────────────────────────────────────
@@ -437,80 +520,38 @@ async def _execute_pipeline(run_id: str, config: ExecuteConfig) -> None:
                 ),
             })
 
-        # ── Scenario execution (sequential, value-passing) ───────────────────
-        scenarios = _scenarios_internal.get(run_id, [])
-        scenario_results: list[ScenarioResultResponse] = []
-        for scenario in scenarios:
-            _log(run_id, f"[scenario] Running '{scenario.name}' ({len(scenario.steps)} steps)…")
-            try:
-                step_tuples = await execute_scenario(scenario, base_url=base_url, timeout=config.timeout_seconds)
-            except Exception as e:
-                _log(run_id, f"[scenario] '{scenario.name}' execution error: {e}")
-                continue
-
-            # Validate each step
-            step_tcs = [t for t, _, _ in step_tuples]
-            step_execs = [e for _, e, _ in step_tuples]
-            step_validations = await ai_validate_batch(step_tcs, step_execs)
-            val_map = {v.test_case_id: v for v in step_validations}
-
-            step_results: list[ScenarioStepResult] = []
-            for (resolved_tc, execution, extracted) in step_tuples:
-                validation = val_map.get(resolved_tc.id) or validate_result(resolved_tc, execution)
-                step_results.append(ScenarioStepResult(
-                    step_index=resolved_tc.step_index or 0,
-                    test_case_id=resolved_tc.id,
-                    endpoint=f"{resolved_tc.endpoint_method} {resolved_tc.endpoint_path}",
-                    description=resolved_tc.description,
-                    passed=validation.passed,
-                    request={
-                        "method": resolved_tc.endpoint_method,
-                        "path": resolved_tc.endpoint_path,
-                        "path_params": resolved_tc.path_params,
-                        "query_params": resolved_tc.query_params,
-                        "headers": resolved_tc.headers,
-                        "body": resolved_tc.body,
-                    },
-                    response={
-                        "status_code": execution.status_code,
-                        "body": execution.response_body,
-                        "latency_ms": execution.latency_ms,
-                        "network_error": execution.network_error,
-                    },
-                    failures=validation.failures,
-                    extracted_values=extracted,
-                ))
-                status_str = str(execution.status_code) if execution.status_code else f"ERR:{execution.network_error}"
-                result_str = "PASS" if validation.passed else f"FAIL({', '.join(validation.failures)})"
-                _log(run_id, f"[scenario:{scenario.name}] step{resolved_tc.step_index} {resolved_tc.endpoint_method} {resolved_tc.endpoint_path} → {status_str} {result_str}")
-
-            scenario_passed = all(s.passed for s in step_results)
-            scenario_results.append(ScenarioResultResponse(
-                scenario_id=scenario.id,
-                name=scenario.name,
-                description=scenario.description,
-                passed=scenario_passed,
-                steps=step_results,
-            ))
+        # ── Scenario execution (crud + business in parallel) ─────────────────
+        crud_scenarios = _crud_scenarios_internal.get(run_id, [])
+        business_scenarios = _business_scenarios_internal.get(run_id, [])
+        crud_scenario_results, business_scenario_results = await asyncio.gather(
+            _run_scenario_list(crud_scenarios, run_id, base_url, config),
+            _run_scenario_list(business_scenarios, run_id, base_url, config),
+        )
 
         # ── Final summary ─────────────────────────────────────────────────────
         passed_count = sum(1 for r in results if r.passed)
-        sc_passed = sum(1 for s in scenario_results if s.passed)
+        crud_sc_passed = sum(1 for s in crud_scenario_results if s.passed)
+        biz_sc_passed = sum(1 for s in business_scenario_results if s.passed)
+        total_scenarios = len(crud_scenario_results) + len(business_scenario_results)
         latencies = [r.response.get("latency_ms", 0) for r in results if r.response.get("latency_ms")]
         avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
-        _log(run_id, f"Done — {passed_count}/{len(results)} TCs passed, {sc_passed}/{len(scenario_results)} scenarios passed, {len(vulnerabilities)} vulnerabilities")
+        _log(run_id, f"Done — {passed_count}/{len(results)} TCs passed, {crud_sc_passed}/{len(crud_scenario_results)} crud + {biz_sc_passed}/{len(business_scenario_results)} business scenarios passed, {len(vulnerabilities)} vulnerabilities")
         _store[run_id] = _store[run_id].model_copy(update={
             "status": "completed",
             "completed_at": datetime.now(timezone.utc),
-            "scenario_results": scenario_results,
+            "crud_scenario_results": crud_scenario_results,
+            "business_scenario_results": business_scenario_results,
             "summary": TestRunSummary(
                 total=len(test_cases),
                 passed=passed_count,
                 failed=len(results) - passed_count,
                 skipped=0,
-                scenario_total=len(scenario_results),
-                scenario_passed=sc_passed,
-                scenario_failed=len(scenario_results) - sc_passed,
+                crud_scenario_total=len(crud_scenario_results),
+                crud_scenario_passed=crud_sc_passed,
+                crud_scenario_failed=len(crud_scenario_results) - crud_sc_passed,
+                business_scenario_total=len(business_scenario_results),
+                business_scenario_passed=biz_sc_passed,
+                business_scenario_failed=len(business_scenario_results) - biz_sc_passed,
                 avg_latency_ms=round(avg_latency, 2),
             ),
         })
@@ -722,7 +763,8 @@ async def gc_loop() -> None:
             _plans.pop(rid, None)
             _test_cases.pop(rid, None)
             _test_cases_internal.pop(rid, None)
-            _scenarios_internal.pop(rid, None)
+            _crud_scenarios_internal.pop(rid, None)
+            _business_scenarios_internal.pop(rid, None)
             _run_logs.pop(rid, None)
             _tasks.pop(rid, None)
         if expired:
@@ -783,6 +825,7 @@ async def _rerun_pipeline(run_id: str, test_cases: list[TestCase], config: Execu
         latencies = [r.response.get("latency_ms", 0) for r in all_results if r.response.get("latency_ms")]
         avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
         total = run.summary.total if run.summary else len(all_results)
+        existing_summary = run.summary
         _store[run_id] = run.model_copy(update={
             "status": "completed",
             "completed_at": datetime.now(timezone.utc),
@@ -792,6 +835,12 @@ async def _rerun_pipeline(run_id: str, test_cases: list[TestCase], config: Execu
                 passed=passed_count,
                 failed=len(all_results) - passed_count,
                 skipped=0,
+                crud_scenario_total=existing_summary.crud_scenario_total if existing_summary else 0,
+                crud_scenario_passed=existing_summary.crud_scenario_passed if existing_summary else 0,
+                crud_scenario_failed=existing_summary.crud_scenario_failed if existing_summary else 0,
+                business_scenario_total=existing_summary.business_scenario_total if existing_summary else 0,
+                business_scenario_passed=existing_summary.business_scenario_passed if existing_summary else 0,
+                business_scenario_failed=existing_summary.business_scenario_failed if existing_summary else 0,
                 avg_latency_ms=round(avg_latency, 2),
             ),
         })

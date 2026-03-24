@@ -214,37 +214,66 @@ async def get_run_logs(run_id: str) -> list[str]:
 async def get_results(
     run_id: str,
     passed: Optional[bool] = Query(None),
+    track: Optional[str] = Query(None, description="Filter by track: individual | crud | business"),
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1, le=1000),
     format: Optional[str] = Query(None, description="Response format: 'junit' for JUnit XML"),
 ) -> Response:
     """Query execution results. Returns partial results while executing.
-    Use ?passed=true for passed, ?passed=false for failed.
+    Use ?passed=true/false to filter. Use ?track=individual|crud|business to filter by track.
     Use ?page/page_size for pagination. Use ?format=junit for JUnit XML."""
     run = test_orchestrator.get_run(run_id)
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run '{run_id}' not found")
-    results = test_orchestrator.get_results(run_id, passed=passed) or []
+
+    ind_results = test_orchestrator.get_results(run_id, passed=passed) or []
+    crud_results = run.crud_scenario_results
+    business_results = run.business_scenario_results
 
     if format == "junit":
-        xml = _generate_junit_xml(run_id, results)
+        xml = _generate_junit_xml(run_id, ind_results)
         return Response(content=xml, media_type="application/xml")
 
-    # Paginate
-    total_count = len(results)
-    start = (page - 1) * page_size
-    paginated = results[start:start + page_size]
+    # Build per-track totals (unfiltered)
+    ind_all = run.results
+    total_summary = {
+        "individual": {
+            "total": len(ind_all),
+            "passed": sum(1 for r in ind_all if r.passed),
+            "failed": sum(1 for r in ind_all if not r.passed),
+        },
+        "crud": {
+            "total": len(crud_results),
+            "passed": sum(1 for s in crud_results if s.passed),
+            "failed": sum(1 for s in crud_results if not s.passed),
+        },
+        "business": {
+            "total": len(business_results),
+            "passed": sum(1 for s in business_results if s.passed),
+            "failed": sum(1 for s in business_results if not s.passed),
+        },
+    }
 
-    import json as _json
+    # Apply track filter
+    show_individual = track in (None, "individual")
+    show_crud = track in (None, "crud")
+    show_business = track in (None, "business")
+
+    # Paginate individual results
+    total_count = len(ind_results)
+    start = (page - 1) * page_size
+    paginated = ind_results[start:start + page_size] if show_individual else []
+
     from fastapi.responses import JSONResponse
     return JSONResponse({
         "status": run.status,
-        "completed": len(run.results),
-        "total": run.summary.total if run.summary else 0,
+        "total_summary": total_summary,
         "page": page,
         "page_size": page_size,
-        "result_count": total_count,
+        "result_count": total_count if show_individual else 0,
         "results": [r.model_dump() for r in paginated],
+        "crud_scenario_results": [s.model_dump() for s in crud_results] if show_crud else [],
+        "business_scenario_results": [s.model_dump() for s in business_results] if show_business else [],
     })
 
 

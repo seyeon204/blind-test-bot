@@ -109,7 +109,8 @@ class PlannedScenario(BaseModel):
 
 class TestPlan(BaseModel):
     individual_tests: list[PlannedEndpoint] = []
-    scenarios: list[PlannedScenario] = []
+    crud_scenarios: list[PlannedScenario] = []      # single-domain CRUD / auth-flow scenarios
+    business_scenarios: list[PlannedScenario] = []  # cross-domain business transaction scenarios
 
 
 # ── Test Scenario (generated from PlannedScenario) ───────────────────────────
