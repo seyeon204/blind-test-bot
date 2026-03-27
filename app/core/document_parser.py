@@ -142,8 +142,26 @@ async def parse_document(raw: str | bytes) -> ParsedSpec:
     )
 
 
+def _extract_pdf_text(raw: bytes) -> str:
+    """Extract plain text from PDF bytes using pypdf."""
+    import io
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(raw))
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return "\n\n".join(pages)
+
+
 async def parse_pdf_document(raw: bytes) -> ParsedSpec:
-    """Parse a PDF by sending it directly to Claude as a native document block."""
+    """Parse a PDF by sending it directly to Claude as a native document block.
+    In Ollama mode, text is extracted via pypdf and sent as plain text instead."""
+    from app.utils.claude_client import _use_claude_cli
+    if _use_claude_cli():
+        logger.info("[document_parser] Ollama mode — extracting PDF text via pypdf")
+        text = _extract_pdf_text(raw)
+        if not text.strip():
+            raise SpecParseError("PDF text extraction returned empty content")
+        return await parse_document(text)
+
     response = await chat_with_tools_pdf(
         pdf_bytes=raw,
         system=_SYSTEM,

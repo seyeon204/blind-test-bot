@@ -1,8 +1,10 @@
 import asyncio
 import base64
 import collections
+import json
 import logging
 import random
+import re
 import types as _types
 import anthropic
 from app.config import settings
@@ -12,6 +14,10 @@ logger = logging.getLogger(__name__)
 
 def _is_mock() -> bool:
     return settings.anthropic_api_key.lower().startswith("mock")
+
+
+def _use_claude_cli() -> bool:
+    return settings.llm_provider == "claude-cli"
 
 
 def _mock_message(tool_name: str, input_data: dict):
@@ -75,9 +81,6 @@ _MOCK_RESPONSES: dict[str, dict] = {
 _client: anthropic.AsyncAnthropic | None = None
 
 # Sliding-window rate limiter — tracks all call timestamps in the last 60 s.
-# Blocks a new call until the number of calls in the window drops below RPM.
-# This is more accurate than a fixed-interval approach: it correctly handles
-# bursts across process restarts and overlapping runs.
 _rate_lock = asyncio.Lock()
 _call_times: collections.deque[float] = collections.deque()
 
@@ -90,13 +93,11 @@ async def _rate_limit() -> None:
     async with _rate_lock:
         while True:
             now = asyncio.get_event_loop().time()
-            # Drop timestamps older than the 60-second window
             while _call_times and _call_times[0] <= now - 60.0:
                 _call_times.popleft()
             if len(_call_times) < rpm:
                 break
-            # Window is full — sleep until the oldest call ages out
-            sleep_for = _call_times[0] + 60.0 - now + 0.05  # +50 ms margin
+            sleep_for = _call_times[0] + 60.0 - now + 0.05
             await asyncio.sleep(sleep_for)
         _call_times.append(asyncio.get_event_loop().time())
 
@@ -152,6 +153,15 @@ async def chat_with_tools(
         logger.info("[claude_client] MOCK mode — returning stub for tool=%s", tool_name)
         return _mock_message(tool_name, _MOCK_RESPONSES.get(tool_name, {}))
 
+    if _use_claude_cli():
+        return await _chat_with_tools_cli(
+            system=system,
+            user=user,
+            tools=tools,
+            tool_choice=tool_choice,
+            max_retries=max_retries,
+        )
+
     client = get_client()
     system_param: str | list = (
         [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
@@ -180,6 +190,54 @@ async def chat_with_tools(
     return await _with_retry(_stream, max_retries, "chat_with_tools")
 
 
+async def _chat_with_tools_cli(
+    system: str,
+    user: str,
+    tools: list[dict],
+    tool_choice: dict | None,
+    max_retries: int,
+) -> _types.SimpleNamespace:
+    """Claude CLI subprocess — uses Pro subscription, no API key needed."""
+    tool_name = tool_choice["name"] if tool_choice else tools[0]["name"]
+    tool_def = next(t for t in tools if t["name"] == tool_name)
+    schema_str = json.dumps(tool_def["input_schema"], indent=2)
+
+    prompt = (
+        f"{system}\n\n"
+        f"{user}\n\n"
+        f"CRITICAL: Respond with ONLY a valid JSON object matching the schema below. "
+        f"No explanation, no markdown code blocks, no extra text — just raw JSON.\n\n"
+        f"Schema:\n{schema_str}"
+    )
+
+    for attempt in range(max_retries):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "-p", prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+            text = stdout.decode().strip()
+
+            # Strip markdown code fences if present
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+
+            data = json.loads(text)
+            block = _types.SimpleNamespace(type="tool_use", name=tool_name, input=data)
+            return _types.SimpleNamespace(content=[block])
+
+        except (json.JSONDecodeError, asyncio.TimeoutError, Exception) as e:
+            if attempt == max_retries - 1:
+                logger.error("[claude_client] CLI failed after %d attempts: %s", max_retries, e)
+                raise
+            wait = 2 * (attempt + 1)
+            logger.warning("[claude_client] CLI attempt %d/%d failed (%s), retry in %.0fs", attempt + 1, max_retries, e, wait)
+            await asyncio.sleep(wait)
+    raise RuntimeError("unreachable")
+
+
 async def chat_with_tools_pdf(
     pdf_bytes: bytes,
     system: str,
@@ -193,6 +251,12 @@ async def chat_with_tools_pdf(
         tool_name = tool_choice["name"] if tool_choice else tools[0]["name"]
         logger.info("[claude_client] MOCK mode — returning stub for tool=%s (pdf)", tool_name)
         return _mock_message(tool_name, _MOCK_RESPONSES.get(tool_name, {}))
+
+    if _use_claude_cli():
+        raise NotImplementedError(
+            "chat_with_tools_pdf should not be called in CLI mode — "
+            "document_parser handles PDF via pypdf text extraction."
+        )
 
     client = get_client()
     pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")

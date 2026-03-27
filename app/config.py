@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     ai_validate_timeout_seconds: int = 120
     # Response body truncation
     max_response_body_bytes: int = 10240
+    # LLM provider — "anthropic" (default) | "claude-cli" (Pro subscription, no API cost)
+    llm_provider: str = "anthropic"
     # Cost tracking — Haiku pricing (per 1M tokens, USD)
     model_input_price_per_mtok: float = 0.80
     model_output_price_per_mtok: float = 4.00

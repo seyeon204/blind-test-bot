@@ -619,6 +619,17 @@ debug, secret, password, private_key
 
 ## 10. Claude 모델 활용
 
+### LLM Provider 선택
+
+`LLM_PROVIDER` 설정으로 Claude 호출 방식을 전환한다.
+
+| `LLM_PROVIDER` | 방식 | 비용 | 조건 |
+|---|---|---|---|
+| `anthropic` (기본) | Anthropic API 직접 호출 | 토큰 과금 | API 키 필요 |
+| `claude-cli` | `claude` CLI subprocess 호출 | **$0** | Claude Pro/Max 구독 필요 |
+
+### anthropic 모드 — 모델별 용도
+
 | 용도 | 모델 | 파일 |
 |---|---|---|
 | 스펙 파싱 (문서/PDF) | `claude_model` (Sonnet 4.6) | `document_parser.py` |
@@ -627,21 +638,36 @@ debug, secret, password, private_key
 | Phase 2b 시나리오 생성 | `claude_tc_model` (Haiku 4.5) | `tc_generator.py` |
 | AI 검증 | `claude_tc_model` (Haiku 4.5) | `ai_validator.py` |
 
-모든 Claude 호출은 `chat_with_tools`를 통해 **tool_use 강제**로 구조화된 JSON 응답만 받는다.
-자유 텍스트 응답 없이 항상 미리 정의된 스키마로 파싱.
+모든 호출은 `chat_with_tools`를 통해 **tool_use 강제**로 구조화된 JSON 응답만 받는다.
 
-### Rate Limiting
+### claude-cli 모드 — 동작 방식
+
+Claude Pro/Max 구독이 있으면 API 키 없이 CLI subprocess로 모든 호출을 대체한다.
+
+```
+chat_with_tools() 호출
+  → tool 스키마를 프롬프트에 내장
+  → claude -p "...CRITICAL: Output ONLY JSON matching schema..." 실행
+  → stdout 파싱 → JSON 추출 → 동일한 SimpleNamespace 반환
+```
+
+- JSON 마크다운 펜스 자동 제거 (```` ```json ... ``` ```` → raw JSON)
+- 파싱 실패 시 최대 5회 재시도 (딜레이 2 * attempt초)
+- 타임아웃 120초 per 호출
+- PDF 파싱: `chat_with_tools_pdf` 미지원 → pypdf로 텍스트 추출 후 일반 `chat_with_tools` 경로로 처리
+
+### Rate Limiting (anthropic 모드만 적용)
 ```
 슬라이딩 윈도우(_call_times deque)로 전역 직렬화
 최소 간격 = 60초 윈도우 내 호출 수 < ANTHROPIC_RPM 유지 (기본 RPM=40)
 
 재시도 (최대 5회):
-  429 RateLimitError    → min(30 * 2^attempt, 300) + random(0,10)초 대기
+  429 RateLimitError      → min(30 * 2^attempt, 300) + random(0,10)초 대기
   529 InternalServerError → min(15 * 2^attempt, 120) + random(0, 5)초 대기
 ```
 
 ### Mock 모드
-`ANTHROPIC_API_KEY=mock-anything` 으로 실행하면 실제 API 호출 없이 테스트 가능.
+`ANTHROPIC_API_KEY=mock-anything` 으로 실행하면 실제 호출 없이 테스트 가능.
 모든 Claude 호출이 미리 정의된 stub 응답을 반환한다.
 
 ---
@@ -652,10 +678,11 @@ debug, secret, password, private_key
 
 | 키 | 기본값 | 설명 |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | (필수) | `mock-*`으로 시작하면 mock 모드 |
-| `CLAUDE_MODEL` | `claude-sonnet-4-6` | 스펙 파싱 / 플랜 수립 모델 |
-| `CLAUDE_TC_MODEL` | `claude-haiku-4-5-20251001` | TC 생성 / AI 검증 모델 |
-| `ANTHROPIC_RPM` | `40` | 분당 API 호출 상한 (0=무제한) |
+| `ANTHROPIC_API_KEY` | (필수) | `mock-*`으로 시작하면 mock 모드. `claude-cli` 모드에선 임의값 가능 |
+| `LLM_PROVIDER` | `anthropic` | `anthropic` (API 키 과금) \| `claude-cli` (Pro 구독, $0) |
+| `CLAUDE_MODEL` | `claude-sonnet-4-6` | 스펙 파싱 / 플랜 수립 모델 (anthropic 모드만) |
+| `CLAUDE_TC_MODEL` | `claude-haiku-4-5-20251001` | TC 생성 / AI 검증 모델 (anthropic 모드만) |
+| `ANTHROPIC_RPM` | `40` | 분당 API 호출 상한 (0=무제한, anthropic 모드만) |
 | `TC_BATCH_DELAY_SECONDS` | `10` | TC 생성 배치 간 딜레이(초) |
 | `MAX_CONCURRENT_REQUESTS` | `10` | 동시 httpx 요청 수 |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | 요청당 타임아웃(초) |
@@ -710,4 +737,19 @@ curl -X POST http://localhost:8000/test-runs/postman-full-run \
   -F "collection_file=@collection.json" \
   -F "target_base_url=http://localhost:8080" \
   -F "variables_file=@vars.json"
+```
+
+### 6. Claude CLI 모드로 실행 (Pro 구독, API 비용 $0)
+```bash
+# .env
+# LLM_PROVIDER=claude-cli
+# ANTHROPIC_API_KEY=mock-not-needed
+
+uvicorn app.main:app --reload
+
+curl -X POST http://localhost:8000/test-runs/full-run \
+  -F "spec_file=@openapi.yaml" \
+  -F "target_base_url=http://localhost:8080" \
+  -F "generator=claude" \
+  -F "strategy=standard"
 ```
