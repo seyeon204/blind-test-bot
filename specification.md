@@ -96,35 +96,48 @@ ParsedSpec
 ### Phase 1: Analyze — 테스트 계획 수립 (`analyzing`)
 **파일**: `tc_planner.py` — **Claude 모드 전용**
 
-전체 스펙을 Claude(Sonnet)에게 보내서 **무엇을 테스트할지 계획**을 먼저 세운다.
+전체 스펙을 Claude에게 보내서 **무엇을 테스트할지 계획**만 먼저 세운다. 실제 TC 값(path_params, body 등)은 이 단계에서 채우지 않는다.
 
-출력 — `TestPlan`:
-- **`individual_tests`**: 엔드포인트별 TC 목록 초안 (happy path, auth_bypass, SQL injection 등)
-- **`crud_scenarios`**: 단일 도메인 통합 시나리오 (CRUD lifecycle, 인증 플로우, 의존성 체인)
-- **`business_scenarios`**: 복수 도메인을 가로지르는 실제 비즈니스 트랜잭션 (e.g. KYC → 계좌개설 → 주문 → 정산)
+**출력 — `TestPlan`:**
 
-Phase 1은 항상 4개의 독립적인 Claude 호출로 구성된다 (순차 실행):
-1. **individual_tests 배치** — 25개씩 묶어 배치 처리 (대용량 스펙 대응)
-2. **CRUD 시나리오** — 전체 스펙으로 단일 호출. 단일 도메인 흐름 식별 (CRUD lifecycle, 인증 흐름)
-3. **도메인 분석** — 전체 스펙으로 단일 호출. API를 비즈니스 도메인으로 분해
-4. **비즈니스 시나리오** — 도메인 맵 기반 단일 호출. 크로스 도메인 통합 시나리오 생성
+| 필드 | 내용 | 예시 |
+|---|---|---|
+| `individual_tests` | 엔드포인트별 TC 설명 목록 | `POST /users → ["happy path", "auth_bypass", "missing email"]` |
+| `crud_scenarios` | 단일 도메인 시나리오 흐름 | `"회원가입 → 로그인 → 프로필 조회"` |
+| `business_scenarios` | 복수 도메인 비즈니스 트랜잭션 | `"KYC → 계좌개설 → 주문 → 정산"` |
+
+**Claude 호출 횟수 (순차 실행):**
+
+| 단계 | 호출 횟수 | 배치 크기 |
+|---|---|---|
+| individual_tests | `ceil(N / 25)` 회 | 25 endpoints/배치 |
+| CRUD 시나리오 | 1회 | 전체 스펙 |
+| 도메인 분석 | 1회 | 전체 스펙 |
+| 비즈니스 시나리오 | 1회 | 도메인 맵 |
+| **합계 (130 endpoints)** | **6 + 3 = 9회** | |
 
 결과 조회: `GET /test-runs/{run_id}/plan?method=GET&path=/users`
 
 ### Phase 2a: Generate — 개별 TC 생성 (`generating`)
 **파일**: `tc_generator.py` (Claude) / `local_tc_generator.py` (local)
 
-Phase 1 계획을 체크리스트로 활용해서 실제 TC를 생성한다.
+Phase 1의 계획을 체크리스트로 활용해서 **실제 값이 채워진 TC**를 생성한다.
 
-**Claude 모드**:
-- 3개 엔드포인트씩 배치로 묶어 Claude(Haiku)에게 요청
-- Phase 1 계획이 있으면 `planned_cases`를 체크리스트로 첨부 → Claude가 해당 케이스를 채워서 반환
-- 결과: 구체적인 path params, query params, request body, expected_status_codes 포함
+**Claude 모드:**
 
-**local 모드**:
-- 규칙 기반으로 즉시 생성 (API 호출 없음)
-- `strategy`별 보안 TC 쿼터 보장: minimal=0, standard=1, exhaustive=5
-- 스키마에서 타입/범위/enum 읽어 경계값 자동 생성
+| 항목 | 내용 |
+|---|---|
+| 배치 크기 | 3 endpoints/배치 (max_tc_per_endpoint 설정 시 2~5) |
+| 호출 횟수 | `ceil(N / 3)` 회 (130 endpoints → **44회**) |
+| 출력 | path_params, query_params, body, expected_status_codes 포함된 완성된 TC |
+| 실패 시 | 해당 배치 자동으로 local 모드 fallback |
+
+> **CLI 모드 주의**: 배치당 ~90초 × 44회 = **약 66분** 소요. Phase 1(9회 × 90초 = 13분)까지 합하면 **총 ~80분**.
+> API 모드에서는 배치당 ~3초 × 53회 = **약 3분**.
+
+**local 모드:**
+- 규칙 기반으로 즉시 생성 (Claude 호출 없음)
+- `strategy`별 보안 TC 쿼터: minimal=2, standard=4, exhaustive=12
 
 결과 조회: `GET /test-runs/{run_id}/test-cases`
 

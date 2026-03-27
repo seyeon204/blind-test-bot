@@ -210,14 +210,18 @@ async def _chat_with_tools_cli(
         f"Schema:\n{schema_str}"
     )
 
+    import time
     for attempt in range(max_retries):
         try:
+            logger.info("[claude_client] CLI → tool=%s (attempt %d/%d) ...", tool_name, attempt + 1, max_retries)
+            t0 = time.monotonic()
             proc = await asyncio.create_subprocess_exec(
                 "claude", "-p", prompt,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+            elapsed = time.monotonic() - t0
             text = stdout.decode().strip()
 
             # Strip markdown code fences if present
@@ -225,15 +229,16 @@ async def _chat_with_tools_cli(
             text = re.sub(r"\s*```$", "", text)
 
             data = json.loads(text)
+            logger.info("[claude_client] CLI ✓ tool=%s (%.1fs)", tool_name, elapsed)
             block = _types.SimpleNamespace(type="tool_use", name=tool_name, input=data)
             return _types.SimpleNamespace(content=[block])
 
         except (json.JSONDecodeError, asyncio.TimeoutError, Exception) as e:
             if attempt == max_retries - 1:
-                logger.error("[claude_client] CLI failed after %d attempts: %s", max_retries, e)
+                logger.error("[claude_client] CLI ✗ tool=%s failed after %d attempts: %s", tool_name, max_retries, e)
                 raise
             wait = 2 * (attempt + 1)
-            logger.warning("[claude_client] CLI attempt %d/%d failed (%s), retry in %.0fs", attempt + 1, max_retries, e, wait)
+            logger.warning("[claude_client] CLI tool=%s attempt %d/%d failed (%s), retry in %.0fs", tool_name, attempt + 1, max_retries, e, wait)
             await asyncio.sleep(wait)
     raise RuntimeError("unreachable")
 

@@ -426,6 +426,7 @@ async def _plan_individual_batch(
         f"API endpoint batch {batch_idx + 1}/{total_batches}:\n\n{spec_text}\n\n"
         "For each endpoint, list all test cases to generate. Leave scenarios empty."
     )
+    logger.info("[tc_planner] individual_tests batch %d/%d (%d endpoints)", batch_idx + 1, total_batches, len(batch))
     try:
         response = await chat_with_tools(
             system=_SYSTEM_INDIVIDUAL,
@@ -461,6 +462,7 @@ async def _plan_crud_scenarios(spec: ParsedSpec, model: str) -> list[PlannedScen
         f"Here is the complete API specification:\n\n{spec_text}\n\n"
         "Identify all CRUD and auth-flow scenarios. Leave individual_tests empty."
     )
+    logger.info("[tc_planner] CRUD scenarios 분석 중...")
     try:
         response = await chat_with_tools(
             system=_SYSTEM_CRUD_SCENARIOS,
@@ -506,6 +508,7 @@ async def _analyze_domains(spec: ParsedSpec, model: str) -> list[_DomainRaw]:
         f"Here is the complete API specification:\n\n{spec_text}\n\n"
         "Identify all business domains and map each endpoint to its domain."
     )
+    logger.info("[tc_planner] 도메인 분석 중...")
     try:
         response = await chat_with_tools(
             system=_SYSTEM_DOMAIN_ANALYSIS,
@@ -549,6 +552,7 @@ async def _plan_business_scenarios(
         f"Domain map:\n\n{domain_map}\n\n"
         "Create realistic multi-domain business transaction scenarios."
     )
+    logger.info("[tc_planner] 비즈니스 시나리오 생성 중... (도메인 %d개)", len(domains))
     try:
         response = await chat_with_tools(
             system=_SYSTEM_BUSINESS_SCENARIOS,

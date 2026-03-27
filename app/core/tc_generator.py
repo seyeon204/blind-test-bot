@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 from app.models.internal import EndpointSpec, ParsedSpec, PlannedEndpoint, PlannedScenario, TestCase, TestScenario
 from app.models.request import GeneratorType, TestStrategy
 from app.config import settings
-from app.utils.claude_client import chat_with_tools
+from app.utils.claude_client import chat_with_tools, _use_claude_cli
 from app.utils.exceptions import TCGenerationError
 
 
@@ -212,8 +212,12 @@ async def generate_test_cases(
     strategy_hint = _STRATEGY_HINT[strategy]
     postman_context = _postman_context_snippet(postman_raw, postman_variables) if postman_raw else ""
 
-    # Smaller batch size when no cap → Claude generates more TCs → larger context per call
-    batch_size = 3 if max_tc_per_endpoint is None else (5 if max_tc_per_endpoint <= 3 else 3 if max_tc_per_endpoint <= 6 else 2)
+    # CLI mode: large batch (25) to minimize subprocess calls (each takes ~90s)
+    # API mode: small batch (3) for focused, high-quality output per call
+    if _use_claude_cli():
+        batch_size = 25
+    else:
+        batch_size = 3 if max_tc_per_endpoint is None else (5 if max_tc_per_endpoint <= 3 else 3 if max_tc_per_endpoint <= 6 else 2)
 
     endpoints = spec.endpoints
     total = len(endpoints)
