@@ -210,7 +210,11 @@ async def _chat_with_tools_cli(
         f"Schema:\n{schema_str}"
     )
 
+    import os
     import time
+    # Unset CLAUDECODE to allow subprocess claude calls when running inside Claude Code
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
     for attempt in range(max_retries):
         try:
             logger.info("[claude_client] CLI → tool=%s (attempt %d/%d) ...", tool_name, attempt + 1, max_retries)
@@ -219,10 +223,15 @@ async def _chat_with_tools_cli(
                 "claude", "-p", prompt,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
             elapsed = time.monotonic() - t0
             text = stdout.decode().strip()
+
+            if proc.returncode != 0:
+                err = stderr.decode().strip()
+                raise RuntimeError(f"CLI exit code {proc.returncode}: {err[:200]}")
 
             # Strip markdown code fences if present
             text = re.sub(r"^```(?:json)?\s*", "", text)
