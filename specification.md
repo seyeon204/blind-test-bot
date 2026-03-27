@@ -195,7 +195,7 @@ Step 3: GET  /profile/{id}   → 200  (token 자동 주입)
 
 #### Step 1: 스펙 업로드 & 파싱 시작
 ```
-POST /test-runs
+POST /api/v1/test-runs
 Content-Type: multipart/form-data
 
 spec_file: <openapi.yaml>
@@ -206,7 +206,7 @@ spec_file: <openapi.yaml>
 
 #### Step 2: TC 생성
 ```
-POST /test-runs/{run_id}/generate
+POST /api/v1/test-runs/{run_id}/generate
 Content-Type: multipart/form-data
 
 generator: local | claude         (기본: local)
@@ -221,7 +221,7 @@ enable_rate_limit_tests: false    (선택, rate limit TC 생성 여부)
 
 #### Step 3: 실행
 ```
-POST /test-runs/{run_id}/execute
+POST /api/v1/test-runs/{run_id}/execute
 Content-Type: multipart/form-data
 
 target_base_url: "http://localhost:8080"
@@ -234,13 +234,15 @@ webhook_url: "https://..."        (선택, 완료 시 결과 POST)
 
 #### 상태/결과 조회
 ```
-GET /test-runs/{run_id}             # 전체 상태
-GET /test-runs/{run_id}/logs        # 이벤트 로그 (실시간)
-GET /test-runs/{run_id}/test-cases  # 생성된 TC 목록
-GET /test-runs/{run_id}/plan        # Phase 1 테스트 플랜 (claude 모드만)
-GET /test-runs/{run_id}/results     # 실행 결과 (파라미터 아래 참고)
-GET /test-runs/{run_id}/stream      # SSE 스트림 (실시간 결과)
-GET /test-runs/{run_id}/estimate    # 비용 예측 (claude 모드)
+GET /api/v1/test-runs/{run_id}                          # 전체 상태
+GET /api/v1/test-runs/{run_id}/logs                     # 이벤트 로그
+GET /api/v1/test-runs/{run_id}/plan                     # Phase 1 테스트 플랜 (claude 모드만)
+GET /api/v1/test-runs/{run_id}/estimate                 # 비용 예측 (claude 모드)
+GET /api/v1/test-runs/{run_id}/test-cases               # 생성된 TC 목록
+GET /api/v1/test-runs/{run_id}/test-cases/{tc_id}       # 단일 TC 조회
+GET /api/v1/test-runs/{run_id}/test-cases/{tc_id}/expected-response  # 예상 응답
+GET /api/v1/test-runs/{run_id}/results                  # 실행 결과 (파라미터 아래 참고)
+GET /api/v1/test-runs/{run_id}/stream                   # SSE 스트림 (실시간 결과)
 ```
 
 결과 조회 파라미터:
@@ -279,7 +281,7 @@ GET /test-runs/{run_id}/results
 내부에서는 생성과 실행을 **동시에** 스트리밍으로 처리한다 (엔드포인트 하나씩 생성되자마자 바로 실행).
 
 ```
-POST /test-runs/full-run
+POST /api/v1/test-runs/full-run
 Content-Type: multipart/form-data
 
 spec_file: <openapi.yaml>
@@ -325,7 +327,7 @@ _execute_pipeline()                  # Phase 3: 실행 + AI 검증
 
 #### Postman 컬렉션을 TC로 직접 임포트
 ```
-POST /test-runs/import-postman
+POST /api/v1/test-runs/import-postman
 Content-Type: multipart/form-data
 
 collection_file: <collection.json>
@@ -338,7 +340,7 @@ variables_file: <vars.json>   (선택)
 
 #### Postman 임포트 + 즉시 실행
 ```
-POST /test-runs/postman-full-run
+POST /api/v1/test-runs/postman-full-run
 Content-Type: multipart/form-data
 
 collection_file: <collection.json>
@@ -353,7 +355,7 @@ variables_file: <vars.json>   (선택)
 
 #### 재실행
 ```
-POST /test-runs/{run_id}/rerun
+POST /api/v1/test-runs/{run_id}/rerun
 Content-Type: multipart/form-data
 
 target_base_url: "http://localhost:8080"
@@ -363,12 +365,12 @@ timeout_seconds: 30
 
 #### 취소
 ```
-POST /test-runs/{run_id}/cancel
+POST /api/v1/test-runs/{run_id}/cancel
 ```
 
 #### SSE 스트림 (Server-Sent Events)
 ```
-GET /test-runs/{run_id}/stream
+GET /api/v1/test-runs/{run_id}/stream
 
 → text/event-stream
 data: {"test_case_id": "...", "passed": true, ...}
@@ -696,7 +698,7 @@ chat_with_tools() 호출
 | `CLAUDE_MODEL` | `claude-sonnet-4-6` | 스펙 파싱 / 플랜 수립 모델 (anthropic 모드만) |
 | `CLAUDE_TC_MODEL` | `claude-haiku-4-5-20251001` | TC 생성 / AI 검증 모델 (anthropic 모드만) |
 | `ANTHROPIC_RPM` | `40` | 분당 API 호출 상한 (0=무제한, anthropic 모드만) |
-| `TC_BATCH_DELAY_SECONDS` | `10` | TC 생성 배치 간 딜레이(초) |
+| `TC_BATCH_DELAY_SECONDS` | `10` | TC 생성 배치 간 딜레이 (anthropic 모드만) |
 | `MAX_CONCURRENT_REQUESTS` | `10` | 동시 httpx 요청 수 |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | 요청당 타임아웃(초) |
 | `RUN_TTL_HOURS` | `24` | 완료 런 메모리 보존 시간 |
@@ -707,13 +709,20 @@ chat_with_tools() 호출
 | `MODEL_CACHE_CREATION_PRICE_PER_MTOK` | `1.00` | 캐시 생성 토큰 단가 |
 | `MODEL_CACHE_READ_PRICE_PER_MTOK` | `0.08` | 캐시 읽기 토큰 단가 |
 
+### LLM Provider별 Phase 2 배치 크기
+
+| Provider | 배치 크기 | 130 endpoints 기준 호출 수 |
+|----------|----------|--------------------------|
+| `anthropic` | 3 | ~44회 (~2분) |
+| `claude-cli` | 25 | ~6회 (~9분) |
+
 ---
 
 ## 부록: 빠른 시작 예시
 
-### 1. OpenAPI 스펙 → 풀런 (Local TC, 무료)
+### 1. OpenAPI 스펙 → 풀런 (Local TC, 무료, 즉시)
 ```bash
-curl -X POST http://localhost:8000/test-runs/full-run \
+curl -X POST http://localhost:8000/api/v1/test-runs/full-run \
   -F "spec_file=@openapi.yaml" \
   -F "target_base_url=http://localhost:8080" \
   -F "generator=local" \
@@ -722,45 +731,48 @@ curl -X POST http://localhost:8000/test-runs/full-run \
 
 ### 2. 상태 폴링
 ```bash
-curl http://localhost:8000/test-runs/{run_id}
+curl http://localhost:8000/api/v1/test-runs/{run_id}
 ```
 
 ### 3. 결과 확인
 ```bash
 # 실패 TC만
-curl "http://localhost:8000/test-runs/{run_id}/results?passed=false"
+curl "http://localhost:8000/api/v1/test-runs/{run_id}/results?passed=false"
+
+# 트랙별 필터
+curl "http://localhost:8000/api/v1/test-runs/{run_id}/results?track=crud"
 
 # JUnit XML 다운로드 (CI/CD 연동)
-curl "http://localhost:8000/test-runs/{run_id}/results?format=junit" -o results.xml
+curl "http://localhost:8000/api/v1/test-runs/{run_id}/results?format=junit" -o results.xml
 ```
 
-### 4. Claude 모드로 더 정교한 테스트 (인증 포함)
+### 4. Claude 모드 (AI 생성, 인증 포함)
 ```bash
-curl -X POST http://localhost:8000/test-runs/full-run \
+curl -X POST http://localhost:8000/api/v1/test-runs/full-run \
   -F "spec_file=@openapi.yaml" \
   -F "target_base_url=http://localhost:8080" \
   -F "generator=claude" \
-  -F "strategy=exhaustive" \
+  -F "strategy=standard" \
   -F 'auth_headers={"Authorization": "Bearer eyJ..."}'
 ```
 
 ### 5. Postman 컬렉션으로 즉시 실행
 ```bash
-curl -X POST http://localhost:8000/test-runs/postman-full-run \
+curl -X POST http://localhost:8000/api/v1/test-runs/postman-full-run \
   -F "collection_file=@collection.json" \
   -F "target_base_url=http://localhost:8080" \
   -F "variables_file=@vars.json"
 ```
 
-### 6. Claude CLI 모드로 실행 (Pro 구독, API 비용 $0)
+### 6. Claude CLI 모드 (Pro 구독, API 비용 $0)
 ```bash
 # .env
 # LLM_PROVIDER=claude-cli
-# ANTHROPIC_API_KEY=mock-not-needed
+# ANTHROPIC_API_KEY=dummy
 
 uvicorn app.main:app --reload
 
-curl -X POST http://localhost:8000/test-runs/full-run \
+curl -X POST http://localhost:8000/api/v1/test-runs/full-run \
   -F "spec_file=@openapi.yaml" \
   -F "target_base_url=http://localhost:8080" \
   -F "generator=claude" \
