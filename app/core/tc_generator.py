@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Optional
 
 import anthropic
@@ -12,10 +13,56 @@ from pydantic import BaseModel, ValidationError, field_validator
 logger = logging.getLogger(__name__)
 
 from app.models.internal import EndpointSpec, ParsedSpec, PlannedEndpoint, PlannedScenario, TestCase, TestScenario
-from app.models.request import GeneratorType, TestStrategy
+from app.models.request import TestStrategy
 from app.config import settings
-from app.utils.claude_client import chat_with_tools, _use_claude_cli
+from app.utils.claude_client import chat_with_tools, get_phase_provider, _is_cli_provider
 from app.utils.exceptions import TCGenerationError
+
+
+def _fill_query_params(ep_spec: EndpointSpec, query_params: dict[str, Any]) -> dict[str, Any]:
+    """Return query_params with placeholders for any required query param missing from the dict.
+
+    The AI occasionally omits required query parameters (e.g. clientId, pageable).
+    This ensures those TCs send something rather than silently skipping the param,
+    which would cause the API to return a different error than intended.
+    """
+    required = [p for p in ep_spec.parameters if p.location == "query" and p.required]
+    if not required:
+        return query_params
+    filled = dict(query_params)
+    for param in required:
+        if param.name in filled:
+            continue
+        schema_type = param.schema_.get("type", "string")
+        if schema_type == "integer":
+            placeholder: Any = 0
+        elif schema_type == "boolean":
+            placeholder = True
+        elif schema_type == "number":
+            placeholder = 0.0
+        else:
+            placeholder = "placeholder"
+        filled[param.name] = placeholder
+        logger.debug("[tc_generator] Auto-filled missing query param '%s' for %s", param.name, ep_spec.path)
+    return filled
+
+
+def _fill_path_params(path: str, path_params: dict[str, Any]) -> dict[str, Any]:
+    """Return path_params with placeholders for any {param} missing from the dict.
+
+    Claude occasionally omits path params despite the prompt instruction. This
+    ensures every generated TC can actually fire an HTTP request (and get a real
+    4xx back) rather than failing with a synthetic 'Unresolved path params' error.
+    """
+    required = re.findall(r'\{([^}]+)\}', path)
+    if not required:
+        return path_params
+    filled = dict(path_params)
+    for param in required:
+        if param not in filled:
+            filled[param] = "00000000-0000-0000-0000-000000000001"
+            logger.debug("[tc_generator] Auto-filled missing path param '%s' for %s", param, path)
+    return filled
 
 
 # ---------------------------------------------------------------------------
@@ -76,28 +123,32 @@ _TC_ITEM_SCHEMA = {
     "required": ["description", "expected_status_codes"],
 }
 
-_GENERATE_TOOL = {
-    "name": "generate_test_cases",
-    "description": "Generate test cases for one or more API endpoints.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "endpoints": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "endpoint_method": {"type": "string"},
-                        "endpoint_path": {"type": "string"},
-                        "test_cases": {"type": "array", "items": _TC_ITEM_SCHEMA},
+def _build_generate_tool(max_tc_per_endpoint: int | None = None) -> dict:
+    tc_array: dict = {"type": "array", "items": _TC_ITEM_SCHEMA}
+    if max_tc_per_endpoint:
+        tc_array["maxItems"] = max_tc_per_endpoint
+    return {
+        "name": "generate_test_cases",
+        "description": "Generate test cases for one or more API endpoints.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "endpoints": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "endpoint_method": {"type": "string"},
+                            "endpoint_path": {"type": "string"},
+                            "test_cases": tc_array,
+                        },
+                        "required": ["endpoint_method", "endpoint_path", "test_cases"],
                     },
-                    "required": ["endpoint_method", "endpoint_path", "test_cases"],
                 },
             },
+            "required": ["endpoints"],
         },
-        "required": ["endpoints"],
-    },
-}
+    }
 
 _SYSTEM = """You are a senior QA engineer writing blind API tests, with expertise in security testing.
 Given endpoint specifications, generate as many test cases as you judge necessary for adequate coverage.
@@ -177,7 +228,7 @@ def _postman_context_snippet(postman_raw: bytes, postman_variables: dict[str, st
 
 async def generate_test_cases(
     spec: ParsedSpec,
-    generator: GeneratorType = GeneratorType.local,
+    provider: str = "local",
     strategy: TestStrategy = TestStrategy.standard,
     auth_headers: dict[str, str] | None = None,
     max_tc_per_endpoint: int | None = None,
@@ -186,6 +237,7 @@ async def generate_test_cases(
     postman_variables: dict[str, str] | None = None,
     plan_by_endpoint: dict[str, PlannedEndpoint] | None = None,
     enable_rate_limit_tests: bool = False,
+    context_md: str | None = None,
 ) -> tuple[list[TestCase], list[str], dict]:
     """Generate test cases — local (free) or claude (AI).
 
@@ -196,7 +248,7 @@ async def generate_test_cases(
     (provided by tc_planner Phase 1). When present, Claude uses the pre-planned
     case descriptions as concrete guidance instead of deriving them from scratch.
     """
-    if generator == GeneratorType.local:
+    if provider == "local":
         from app.core.local_tc_generator import generate_local
         cases = generate_local(
             spec,
@@ -208,13 +260,17 @@ async def generate_test_cases(
         )
         return cases, [], {}
 
-    # claude path — sequential batch mode
+    # AI path — sequential batch mode
     strategy_hint = _STRATEGY_HINT[strategy]
     postman_context = _postman_context_snippet(postman_raw, postman_variables) if postman_raw else ""
+    context_snippet = f"\n\n## Additional API Context\n{context_md}" if context_md else ""
+    # provider is passed in by the caller; fall back to env config if not set
+    if not provider:
+        provider = get_phase_provider("phase2a")
 
     # CLI mode: large batch (25) to minimize subprocess calls (each takes ~90s)
     # API mode: small batch (3) for focused, high-quality output per call
-    if _use_claude_cli():
+    if _is_cli_provider(provider):
         batch_size = 25
     else:
         batch_size = 3 if max_tc_per_endpoint is None else (5 if max_tc_per_endpoint <= 3 else 3 if max_tc_per_endpoint <= 6 else 2)
@@ -237,7 +293,7 @@ async def generate_test_cases(
         logger.info("[tc_generator] Batch %d/%d (delay=%.1fs): %s", b_idx + 1, len(batches), delay, ep_labels)
         try:
             batch_plans = {f"{ep.method} {ep.path}": plan_by_endpoint[f"{ep.method} {ep.path}"] for ep in batch if plan_by_endpoint and f"{ep.method} {ep.path}" in plan_by_endpoint} if plan_by_endpoint else {}
-            cases, usage = await _generate_for_batch(batch, strategy_hint, max_tc_per_endpoint, auth_headers or {}, postman_context, settings.claude_tc_model, batch_plans or None)
+            cases, usage = await _generate_for_batch(batch, strategy_hint, max_tc_per_endpoint, auth_headers or {}, postman_context + context_snippet, settings.claude_tc_model, batch_plans or None, provider=provider)
             total_tokens["input"] += usage.get("input", 0)
             total_tokens["output"] += usage.get("output", 0)
             total_tokens["cache_creation"] += usage.get("cache_creation", 0)
@@ -294,6 +350,7 @@ async def _generate_for_batch(
     postman_context: str = "",
     model: str | None = None,
     batch_plans: dict[str, PlannedEndpoint] | None = None,
+    provider: str = "anthropic",
 ) -> tuple[list[TestCase], dict]:
     auth_hint = f"Auth headers available: {list(auth_headers.keys())}" if auth_headers else "No auth headers provided."
 
@@ -328,10 +385,11 @@ async def _generate_for_batch(
         response = await chat_with_tools(
             system=_SYSTEM,
             user=user_prompt,
-            tools=[_GENERATE_TOOL],
+            tools=[_build_generate_tool(max_tc_per_endpoint)],
             tool_choice={"type": "tool", "name": "generate_test_cases"},
             model=model,
             cache_system=True,
+            provider=provider,
         )
     except Exception as e:
         raise TCGenerationError(f"Claude API error for batch: {e}") from e
@@ -356,6 +414,7 @@ async def _generate_for_batch(
         raise TCGenerationError(f"Claude returned invalid tool_use structure: {e}") from e
 
     valid = {(ep.method, ep.path) for ep in batch}
+    spec_lookup: dict[tuple[str, str], EndpointSpec] = {(ep.method, ep.path): ep for ep in batch}
 
     cases: list[TestCase] = []
     for ep_block in output.endpoints:
@@ -363,14 +422,15 @@ async def _generate_for_batch(
         path = ep_block.endpoint_path
         if (method, path) not in valid:
             continue
+        ep_spec = spec_lookup[(method, path)]
         for tc in ep_block.test_cases:
             tc_headers = {**auth_headers, **tc.headers}
             cases.append(TestCase(
                 endpoint_method=method,
                 endpoint_path=path,
                 description=tc.description,
-                path_params=tc.path_params,
-                query_params=tc.query_params,
+                path_params=_fill_path_params(path, tc.path_params),
+                query_params=_fill_query_params(ep_spec, tc.query_params),
                 headers=tc_headers,
                 body=tc.body,
                 expected_status_codes=tc.expected_status_codes,
@@ -436,7 +496,10 @@ Rules:
   Example: if step 1 extracts {"userId": "id"} from the response, step 2 can use {"userId": "{{userId}}"} in path_params.
 - In the extract field, use dot notation to navigate the response body: "id", "data.id", "user.profile.id".
 - Use realistic values for any fields not extracted from previous steps.
-- Every step must populate path_params for ALL path parameters in the endpoint path.
+- CRITICAL: Every step must populate path_params for ALL path parameters in the endpoint path — never leave a {param} empty.
+  If a prior step creates a resource (e.g. POST /api/tenants returns a tenant id), you MUST:
+  (a) add extract: {"tenantId": "<json-path-to-id>"} on that step, AND
+  (b) set path_params: {"tenantId": "{{tenantId}}"} on every subsequent step whose path contains {tenantId}.
 - Set expected_status_codes appropriately for each step (2xx for success steps).
 - Always include auth headers in steps that require authentication."""
 
@@ -479,6 +542,7 @@ async def generate_scenario_test_cases(
     spec: ParsedSpec,
     auth_headers: dict[str, str] | None = None,
     model: str | None = None,
+    provider: str | None = None,
 ) -> list[TestScenario]:
     """Phase 2b — generate concrete step-by-step TestCases for each PlannedScenario."""
     if not planned_scenarios:
@@ -508,6 +572,7 @@ async def generate_scenario_test_cases(
         f"{auth_hint}"
     )
 
+    provider = provider or get_phase_provider("phase2b")
     try:
         response = await chat_with_tools(
             system=_SCENARIO_SYSTEM,
@@ -516,6 +581,7 @@ async def generate_scenario_test_cases(
             tool_choice={"type": "tool", "name": "generate_scenario_steps"},
             model=model or settings.claude_tc_model,
             cache_system=True,
+            provider=provider,
         )
     except Exception as e:
         raise TCGenerationError(f"Claude API error for scenario generation: {e}") from e
@@ -543,7 +609,7 @@ async def generate_scenario_test_cases(
                 endpoint_method=raw_step.endpoint_method.upper(),
                 endpoint_path=raw_step.endpoint_path,
                 description=raw_step.description,
-                path_params=raw_step.path_params,
+                path_params=_fill_path_params(raw_step.endpoint_path, raw_step.path_params),
                 query_params=raw_step.query_params,
                 headers=tc_headers,
                 body=raw_step.body,

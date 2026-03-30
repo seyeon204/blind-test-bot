@@ -14,10 +14,11 @@ from app.core.spec_parser import parse_spec
 from app.core.tc_generator import generate_scenario_test_cases, generate_test_cases
 from app.core.tc_planner import plan_test_cases
 from app.core.ai_validator import ai_validate_batch
+from app.utils.claude_client import _is_cli_provider, _normalize_provider
 from app.core.validator import detect_vulnerability, validate_result
 from app.models.internal import ParsedSpec, TestCase, TestPlan, TestScenario
 from app.config import settings
-from app.models.request import GenerateConfig, ExecuteConfig, GeneratorType
+from app.models.request import GenerateConfig, ExecuteConfig
 from app.models.response import (
     CostEstimateResponse,
     EndpointSummary,
@@ -55,6 +56,8 @@ _test_cases_internal: dict[str, list[TestCase]] = {}
 _test_cases: dict[str, list[GeneratedTestCase]] = {}
 # run_id → event log
 _run_logs: dict[str, list[str]] = {}
+# run_id → GenerateConfig (kept so _execute_pipeline can read phase3 provider)
+_generate_configs: dict[str, GenerateConfig] = {}
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -74,6 +77,26 @@ def _fail(run_id: str, err: Exception) -> None:
             "completed_at": datetime.now(timezone.utc),
             "error_message": str(err),
         })
+
+
+# ai-recom preset: recommended free CLI provider per phase
+_RECOMMENDED: dict[str, str] = {
+    "phase1_provider": "claude-cli",   # planning — Claude CLI (best reasoning, $0)
+    "phase2_provider": "gemini-cli",   # TC generation — Gemini CLI (fast, $0)
+    "phase3_provider": "gemini-cli",   # AI validation — Gemini CLI (fast, $0)
+}
+
+
+def _eff_provider(config: GenerateConfig, phase_attr: str) -> str:
+    """Return the normalized provider string for a pipeline phase.
+
+    'ai-recom' expands to the recommended free CLI provider for that phase.
+    'claude-api' is normalized to 'anthropic'.
+    """
+    value = getattr(config, phase_attr).value
+    if value == "ai-recom":
+        value = _RECOMMENDED[phase_attr]
+    return _normalize_provider(value)
 
 
 # ── public read API ───────────────────────────────────────────────────────────
@@ -166,7 +189,7 @@ def get_plan(
     return TestPlanResponse(
         total_endpoints=len(plan.individual_tests),
         total_planned_cases=sum(len(ep.planned_cases) for ep in plan.individual_tests),
-        total_scenarios=len(plan.scenarios),
+        total_scenarios=len(plan.crud_scenarios) + len(plan.business_scenarios),
         crud_scenario_count=crud_count,
         business_scenario_count=business_count,
         individual_tests=endpoint_responses,
@@ -235,7 +258,7 @@ def start_parse(raw_spec: bytes, filename: str) -> str:
 
 # ── step 2: generate ──────────────────────────────────────────────────────────
 
-async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: bytes | None = None, postman_variables: dict[str, str] | None = None) -> None:
+async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: bytes | None = None, postman_variables: dict[str, str] | None = None, context_md: str | None = None) -> None:
     try:
         spec = _specs.get(run_id)
         if not spec:
@@ -246,13 +269,18 @@ async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: b
         _crud_scenarios_internal[run_id] = []
         _business_scenarios_internal[run_id] = []
 
-        # ── Phase 1: Analyze (claude mode only) ──────────────────────────────
+        # Resolve per-phase providers once for this run
+        p1 = _eff_provider(config, "phase1_provider")
+        p2 = _eff_provider(config, "phase2_provider")
+        p2b = p2  # same provider for both 2a (individual) and 2b (scenario)
+
+        # ── Phase 1: Analyze (skipped when phase1 provider = local) ──────────
         plan_by_endpoint = None
-        if config.generator == GeneratorType.claude:
-            _log(run_id, "Phase 1: Analysing full spec to build test plan…")
+        if p1 != "local":
+            _log(run_id, f"Phase 1: Analyzing full spec to build test plan… (provider={p1})")
             _store[run_id] = _store[run_id].model_copy(update={"status": "analyzing"})
             try:
-                plan = await plan_test_cases(spec)
+                plan = await plan_test_cases(spec, context_md=context_md, provider=p1)
                 _plans[run_id] = plan
                 plan_by_endpoint = {f"{ep.method} {ep.path}": ep for ep in plan.individual_tests}
                 _log(run_id, f"Plan ready: {len(plan.individual_tests)} endpoints, {len(plan.crud_scenarios)} crud + {len(plan.business_scenarios)} business scenarios")
@@ -261,7 +289,7 @@ async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: b
                 plan = None
 
         # ── Phase 2a: Individual TC generation ───────────────────────────────
-        _log(run_id, f"Phase 2: Generating TCs (strategy={config.strategy}, max={config.max_tc_per_endpoint})")
+        _log(run_id, f"Phase 2: Generating TCs (provider={p2}, strategy={config.strategy}, max={config.max_tc_per_endpoint})")
         _store[run_id] = _store[run_id].model_copy(update={
             "status": "generating",
             "test_case_count": 0,
@@ -292,7 +320,7 @@ async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: b
 
         all_cases, skipped, tokens = await generate_test_cases(
             spec,
-            generator=config.generator,
+            provider=p2,
             strategy=config.strategy,
             auth_headers=config.auth_headers,
             max_tc_per_endpoint=config.max_tc_per_endpoint,
@@ -301,6 +329,7 @@ async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: b
             postman_variables=postman_variables,
             plan_by_endpoint=plan_by_endpoint,
             enable_rate_limit_tests=config.enable_rate_limit_tests,
+            context_md=context_md,
         )
         _test_cases_internal[run_id] = all_cases
         cost = _compute_cost(tokens)
@@ -314,18 +343,30 @@ async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: b
                 "estimated_cost_usd": _store[run_id].estimated_cost_usd + cost,
             })
 
-        # ── Phase 2b: Scenario TC generation (claude mode only, parallel) ────
+        # ── Phase 2b: Scenario TC generation (skipped when provider = local) ──
         plan = _plans.get(run_id)
-        if config.generator == GeneratorType.claude and plan and (plan.crud_scenarios or plan.business_scenarios):
+        if p2b != "local" and plan and (plan.crud_scenarios or plan.business_scenarios):
             crud_count = len(plan.crud_scenarios)
             biz_count = len(plan.business_scenarios)
-            _log(run_id, f"Phase 2b: Generating {crud_count} crud + {biz_count} business scenarios (parallel)…")
+            mode_label = "sequential" if _is_cli_provider(p2b) else "parallel"
+            _log(run_id, f"Phase 2b: Generating {crud_count} crud + {biz_count} business scenarios (provider={p2b}, {mode_label})…")
             try:
-                crud_gen, business_gen = await asyncio.gather(
-                    generate_scenario_test_cases(plan.crud_scenarios, spec, auth_headers=config.auth_headers),
-                    generate_scenario_test_cases(plan.business_scenarios, spec, auth_headers=config.auth_headers),
-                    return_exceptions=True,
-                )
+                if _is_cli_provider(p2b):
+                    # CLI mode: run sequentially to avoid concurrent subprocess spawning
+                    try:
+                        crud_gen = await generate_scenario_test_cases(plan.crud_scenarios, spec, auth_headers=config.auth_headers, provider=p2b)
+                    except Exception as e:
+                        crud_gen = e
+                    try:
+                        business_gen = await generate_scenario_test_cases(plan.business_scenarios, spec, auth_headers=config.auth_headers, provider=p2b)
+                    except Exception as e:
+                        business_gen = e
+                else:
+                    crud_gen, business_gen = await asyncio.gather(
+                        generate_scenario_test_cases(plan.crud_scenarios, spec, auth_headers=config.auth_headers, provider=p2b),
+                        generate_scenario_test_cases(plan.business_scenarios, spec, auth_headers=config.auth_headers, provider=p2b),
+                        return_exceptions=True,
+                    )
                 if not isinstance(crud_gen, Exception):
                     _crud_scenarios_internal[run_id] = crud_gen
                 else:
@@ -361,6 +402,7 @@ async def _generate_pipeline(run_id: str, config: GenerateConfig, postman_raw: b
 
 
 def start_generate(run_id: str, config: GenerateConfig) -> None:
+    _generate_configs[run_id] = config
     task = asyncio.create_task(_generate_pipeline(run_id, config))
     _tasks[run_id] = task
 
@@ -372,6 +414,7 @@ async def _run_scenario_list(
     run_id: str,
     base_url: str,
     config: ExecuteConfig,
+    phase3_provider: str | None = None,
 ) -> list[ScenarioResultResponse]:
     """Execute a list of scenarios sequentially, returning ScenarioResultResponse list."""
     results: list[ScenarioResultResponse] = []
@@ -385,7 +428,7 @@ async def _run_scenario_list(
 
         step_tcs = [t for t, _, _ in step_tuples]
         step_execs = [e for _, e, _ in step_tuples]
-        step_validations = await ai_validate_batch(step_tcs, step_execs)
+        step_validations = await ai_validate_batch(step_tcs, step_execs, provider=phase3_provider)
         val_map = {v.test_case_id: v for v in step_validations}
 
         step_results: list[ScenarioStepResult] = []
@@ -437,6 +480,11 @@ async def _execute_pipeline(run_id: str, config: ExecuteConfig) -> None:
         if not test_cases:
             raise ValueError("No test cases found — run generate first")
 
+        # Resolve Phase 3 provider: prefer the stored generate config, fall back to env
+        gen_config = _generate_configs.get(run_id)
+        p3 = _eff_provider(gen_config, "phase3_provider") if gen_config else "local"
+
+
         base_url = config.target_base_url
         _log(run_id, f"Executing {len(test_cases)} TCs against {base_url}")
         _store[run_id] = _store[run_id].model_copy(update={
@@ -462,7 +510,7 @@ async def _execute_pipeline(run_id: str, config: ExecuteConfig) -> None:
             async for execution in stream_executions(chunk, base_url=base_url, timeout=config.timeout_seconds):
                 chunk_executions.append(execution)
 
-            validations = await ai_validate_batch(chunk, chunk_executions)
+            validations = await ai_validate_batch(chunk, chunk_executions, provider=p3)
             validation_map = {v.test_case_id: v for v in validations}
 
             for execution in chunk_executions:
@@ -524,8 +572,8 @@ async def _execute_pipeline(run_id: str, config: ExecuteConfig) -> None:
         crud_scenarios = _crud_scenarios_internal.get(run_id, [])
         business_scenarios = _business_scenarios_internal.get(run_id, [])
         crud_scenario_results, business_scenario_results = await asyncio.gather(
-            _run_scenario_list(crud_scenarios, run_id, base_url, config),
-            _run_scenario_list(business_scenarios, run_id, base_url, config),
+            _run_scenario_list(crud_scenarios, run_id, base_url, config, phase3_provider=p3),
+            _run_scenario_list(business_scenarios, run_id, base_url, config, phase3_provider=p3),
         )
 
         # ── Final summary ─────────────────────────────────────────────────────
@@ -642,6 +690,7 @@ async def _full_run_pipeline(
     execute_config: ExecuteConfig,
     postman_raw: bytes | None = None,
     postman_variables: dict[str, str] | None = None,
+    context_md: str | None = None,
 ) -> None:
     """Sequential parse → generate → execute pipeline.
 
@@ -652,7 +701,8 @@ async def _full_run_pipeline(
         await _parse_pipeline(run_id, raw_spec, filename)
         if _store[run_id].status == "failed":
             return
-        await _generate_pipeline(run_id, generate_config, postman_raw, postman_variables)
+        _generate_configs[run_id] = generate_config
+        await _generate_pipeline(run_id, generate_config, postman_raw, postman_variables, context_md)
         if _store[run_id].status == "failed":
             return
         await _execute_pipeline(run_id, execute_config)
@@ -669,6 +719,7 @@ def start_full_run(
     execute_config: ExecuteConfig,
     postman_raw: bytes | None = None,
     postman_variables: dict[str, str] | None = None,
+    context_md: str | None = None,
 ) -> str:
     run_id = str(uuid.uuid4())
     _store[run_id] = TestRunStatusResponse(
@@ -677,7 +728,7 @@ def start_full_run(
         created_at=datetime.now(timezone.utc),
     )
     task = asyncio.create_task(
-        _full_run_pipeline(run_id, raw_spec, filename, generate_config, execute_config, postman_raw, postman_variables)
+        _full_run_pipeline(run_id, raw_spec, filename, generate_config, execute_config, postman_raw, postman_variables, context_md)
     )
     _tasks[run_id] = task
     return run_id
@@ -719,7 +770,7 @@ def _compute_cost(tokens: dict) -> float:
 
 # ── Cost estimate ─────────────────────────────────────────────────────────────
 
-def get_cost_estimate(run_id: str, generator: str, strategy: str) -> CostEstimateResponse | None:
+def get_cost_estimate(run_id: str, phase2_provider: str, strategy: str) -> CostEstimateResponse | None:
     run = _store.get(run_id)
     if not run:
         return None
@@ -727,7 +778,7 @@ def get_cost_estimate(run_id: str, generator: str, strategy: str) -> CostEstimat
     ep_count = len(run.endpoints)
     tc_count = ep_count * tc_per_ep
     tokens = tc_count * 800
-    if generator != "claude":
+    if phase2_provider == "local":
         return CostEstimateResponse(
             endpoint_count=ep_count,
             estimated_tc_count=tc_count,

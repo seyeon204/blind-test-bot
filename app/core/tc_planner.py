@@ -31,7 +31,7 @@ from app.models.internal import (
     PlannedScenario,
     TestPlan,
 )
-from app.utils.claude_client import chat_with_tools
+from app.utils.claude_client import chat_with_tools, get_phase_provider
 from app.utils.exceptions import TCGenerationError
 
 logger = logging.getLogger(__name__)
@@ -419,11 +419,14 @@ async def _plan_individual_batch(
     batch_idx: int,
     total_batches: int,
     model: str,
+    context_md: str | None = None,
+    provider: str = "anthropic",
 ) -> list[_PlannedEndpointRaw]:
     mini = ParsedSpec(source_format="openapi", base_url=None, endpoints=batch)
     spec_text = _spec_summary(mini)
+    context_section = f"\n\n## Additional API Context\n{context_md}" if context_md else ""
     user_prompt = (
-        f"API endpoint batch {batch_idx + 1}/{total_batches}:\n\n{spec_text}\n\n"
+        f"API endpoint batch {batch_idx + 1}/{total_batches}:\n\n{spec_text}{context_section}\n\n"
         "For each endpoint, list all test cases to generate. Leave scenarios empty."
     )
     logger.info("[tc_planner] individual_tests batch %d/%d (%d endpoints)", batch_idx + 1, total_batches, len(batch))
@@ -436,6 +439,7 @@ async def _plan_individual_batch(
             model=model,
             cache_system=True,
             max_tokens=16384,
+            provider=provider,
         )
     except Exception as e:
         logger.warning("[tc_planner] individual batch %d failed (%s) — skipping", batch_idx + 1, e)
@@ -456,10 +460,11 @@ async def _plan_individual_batch(
 # CRUD scenarios
 # ---------------------------------------------------------------------------
 
-async def _plan_crud_scenarios(spec: ParsedSpec, model: str) -> list[PlannedScenario]:
+async def _plan_crud_scenarios(spec: ParsedSpec, model: str, context_md: str | None = None, provider: str = "anthropic") -> list[PlannedScenario]:
     spec_text = _spec_summary(spec)
+    context_section = f"\n\n## Additional API Context\n{context_md}" if context_md else ""
     user_prompt = (
-        f"Here is the complete API specification:\n\n{spec_text}\n\n"
+        f"Here is the complete API specification:\n\n{spec_text}{context_section}\n\n"
         "Identify all CRUD and auth-flow scenarios. Leave individual_tests empty."
     )
     logger.info("[tc_planner] CRUD scenarios 분석 중...")
@@ -472,6 +477,7 @@ async def _plan_crud_scenarios(spec: ParsedSpec, model: str) -> list[PlannedScen
             model=model,
             cache_system=True,
             max_tokens=8192,
+            provider=provider,
         )
     except Exception as e:
         logger.warning("[tc_planner] CRUD scenarios call failed (%s)", e)
@@ -501,11 +507,12 @@ async def _plan_crud_scenarios(spec: ParsedSpec, model: str) -> list[PlannedScen
 # Business scenarios (2-step: domain analysis → transaction scenarios)
 # ---------------------------------------------------------------------------
 
-async def _analyze_domains(spec: ParsedSpec, model: str) -> list[_DomainRaw]:
+async def _analyze_domains(spec: ParsedSpec, model: str, context_md: str | None = None, provider: str = "anthropic") -> list[_DomainRaw]:
     """Step A: ask Claude to decompose the spec into business domains."""
     spec_text = _spec_summary(spec)
+    context_section = f"\n\n## Additional API Context\n{context_md}" if context_md else ""
     user_prompt = (
-        f"Here is the complete API specification:\n\n{spec_text}\n\n"
+        f"Here is the complete API specification:\n\n{spec_text}{context_section}\n\n"
         "Identify all business domains and map each endpoint to its domain."
     )
     logger.info("[tc_planner] 도메인 분석 중...")
@@ -518,6 +525,7 @@ async def _analyze_domains(spec: ParsedSpec, model: str) -> list[_DomainRaw]:
             model=model,
             cache_system=True,
             max_tokens=8192,
+            provider=provider,
         )
     except Exception as e:
         logger.warning("[tc_planner] domain analysis failed (%s)", e)
@@ -539,6 +547,7 @@ async def _plan_business_scenarios(
     spec: ParsedSpec,
     domains: list[_DomainRaw],
     model: str,
+    provider: str = "anthropic",
 ) -> list[PlannedScenario]:
     """Step B: given domain map, ask Claude to create cross-domain transaction scenarios."""
     if not domains:
@@ -561,6 +570,7 @@ async def _plan_business_scenarios(
             tool_choice={"type": "tool", "name": "create_business_scenarios"},
             model=model,
             max_tokens=8192,
+            provider=provider,
         )
     except Exception as e:
         logger.warning("[tc_planner] business scenarios call failed (%s)", e)
@@ -594,6 +604,8 @@ async def _plan_business_scenarios(
 async def plan_test_cases(
     spec: ParsedSpec,
     model: str | None = None,
+    context_md: str | None = None,
+    provider: str | None = None,
 ) -> TestPlan:
     """Phase 1: produce a structured TestPlan.
 
@@ -604,6 +616,7 @@ async def plan_test_cases(
       4. Business scenarios (domain map, 1 call)
     """
     effective_model = model or settings.claude_model
+    provider = provider or get_phase_provider("phase1")
     n = len(spec.endpoints)
 
     # ── Individual tests ────────────────────────────────────────────────────
@@ -618,15 +631,15 @@ async def plan_test_cases(
 
     individual_raw: list[_PlannedEndpointRaw] = []
     for idx, batch in enumerate(batches):
-        results = await _plan_individual_batch(batch, idx, total, effective_model)
+        results = await _plan_individual_batch(batch, idx, total, effective_model, context_md=context_md, provider=provider)
         individual_raw.extend(results)
 
     # ── CRUD scenarios ───────────────────────────────────────────────────────
-    crud_scenarios = await _plan_crud_scenarios(spec, effective_model)
+    crud_scenarios = await _plan_crud_scenarios(spec, effective_model, context_md=context_md, provider=provider)
 
     # ── Business scenarios (2-step) ──────────────────────────────────────────
-    domains = await _analyze_domains(spec, effective_model)
-    business_scenarios = await _plan_business_scenarios(spec, domains, effective_model)
+    domains = await _analyze_domains(spec, effective_model, context_md=context_md, provider=provider)
+    business_scenarios = await _plan_business_scenarios(spec, domains, effective_model, provider=provider)
 
     # ── Assemble ─────────────────────────────────────────────────────────────
     individual_tests = [

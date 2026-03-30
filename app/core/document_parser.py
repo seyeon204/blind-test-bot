@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from app.models.internal import EndpointSpec, ParameterSpec, ParsedSpec
-from app.utils.claude_client import chat_with_tools, chat_with_tools_pdf
+from app.utils.claude_client import chat_with_tools, chat_with_tools_pdf, get_phase_provider, _is_cli_provider
 from app.utils.exceptions import SpecParseError
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,7 @@ async def parse_document(raw: str | bytes) -> ParsedSpec:
         tools=[_EXTRACT_TOOL],
         tool_choice={"type": "tool", "name": "extract_api_spec"},
         cache_system=True,
+        provider=get_phase_provider("phase0"),
     )
 
     # Find the tool_use block
@@ -153,10 +154,10 @@ def _extract_pdf_text(raw: bytes) -> str:
 
 async def parse_pdf_document(raw: bytes) -> ParsedSpec:
     """Parse a PDF by sending it directly to Claude as a native document block.
-    In Ollama mode, text is extracted via pypdf and sent as plain text instead."""
-    from app.utils.claude_client import _use_claude_cli
-    if _use_claude_cli():
-        logger.info("[document_parser] Ollama mode — extracting PDF text via pypdf")
+    In CLI mode, text is extracted via pypdf and sent as plain text instead."""
+    provider = get_phase_provider("phase0")
+    if _is_cli_provider(provider):
+        logger.info("[document_parser] CLI mode — extracting PDF text via pypdf")
         text = _extract_pdf_text(raw)
         if not text.strip():
             raise SpecParseError("PDF text extraction returned empty content")

@@ -202,7 +202,7 @@ async def test_generate_wrong_status_returns_409(client):
     # Immediately call generate before parsing completes — should get 409
     gen_resp = await client.post(
         f"{TR}/{run_id}/generate",
-        data={"generator": "local", "strategy": "minimal"},
+        data={"phase2_provider": "local", "strategy": "minimal"},
     )
     assert gen_resp.status_code == 409
 
@@ -218,7 +218,7 @@ async def test_generate_after_parse_transitions_to_generated(client):
 
     gen_resp = await client.post(
         f"{TR}/{run_id}/generate",
-        data={"generator": "local", "strategy": "standard"},
+        data={"phase2_provider": "local", "strategy": "standard"},
     )
     assert gen_resp.status_code == 202
 
@@ -237,7 +237,7 @@ async def test_generated_run_has_test_cases(client):
     await wait_for_run(client, run_id, {"parsed"})
     await client.post(
         f"{TR}/{run_id}/generate",
-        data={"generator": "local", "strategy": "standard"},
+        data={"phase2_provider": "local", "strategy": "standard"},
     )
     await wait_for_run(client, run_id, {"generated"})
 
@@ -258,7 +258,7 @@ async def test_full_run_returns_202_with_run_id(client):
     resp = await client.post(
         f"{TR}/full-run",
         files={"spec_file": ("openapi.yaml", SIMPLE_OPENAPI, "application/yaml")},
-        data={"target_base_url": "http://localhost:19999", "generator": "local"},
+        data={"target_base_url": "http://localhost:19999", "phase2_provider": "local"},
     )
     assert resp.status_code == 202
     assert "run_id" in resp.json()
@@ -269,7 +269,7 @@ async def test_full_run_completes(client):
     resp = await client.post(
         f"{TR}/full-run",
         files={"spec_file": ("openapi.yaml", SIMPLE_OPENAPI, "application/yaml")},
-        data={"target_base_url": "http://localhost:19999", "generator": "local"},
+        data={"target_base_url": "http://localhost:19999", "phase2_provider": "local"},
     )
     run_id = resp.json()["run_id"]
     final = await wait_for_run(client, run_id, {"completed", "failed"}, timeout=10.0)
@@ -281,7 +281,7 @@ async def test_full_run_has_summary(client):
     resp = await client.post(
         f"{TR}/full-run",
         files={"spec_file": ("openapi.yaml", SIMPLE_OPENAPI, "application/yaml")},
-        data={"target_base_url": "http://localhost:19999", "generator": "local"},
+        data={"target_base_url": "http://localhost:19999", "phase2_provider": "local"},
     )
     run_id = resp.json()["run_id"]
     final = await wait_for_run(client, run_id, {"completed", "failed"}, timeout=10.0)
@@ -296,7 +296,7 @@ async def test_full_run_has_results(client):
     resp = await client.post(
         f"{TR}/full-run",
         files={"spec_file": ("openapi.yaml", SIMPLE_OPENAPI, "application/yaml")},
-        data={"target_base_url": "http://localhost:19999", "generator": "local"},
+        data={"target_base_url": "http://localhost:19999", "phase2_provider": "local"},
     )
     run_id = resp.json()["run_id"]
     await wait_for_run(client, run_id, {"completed", "failed"}, timeout=10.0)
@@ -312,7 +312,7 @@ async def test_full_run_results_filter_passed(client):
     resp = await client.post(
         f"{TR}/full-run",
         files={"spec_file": ("openapi.yaml", SIMPLE_OPENAPI, "application/yaml")},
-        data={"target_base_url": "http://localhost:19999", "generator": "local"},
+        data={"target_base_url": "http://localhost:19999", "phase2_provider": "local"},
     )
     run_id = resp.json()["run_id"]
     await wait_for_run(client, run_id, {"completed", "failed"}, timeout=10.0)
@@ -329,7 +329,7 @@ async def test_full_run_logs_non_empty(client):
     resp = await client.post(
         f"{TR}/full-run",
         files={"spec_file": ("openapi.yaml", SIMPLE_OPENAPI, "application/yaml")},
-        data={"target_base_url": "http://localhost:19999", "generator": "local"},
+        data={"target_base_url": "http://localhost:19999", "phase2_provider": "local"},
     )
     run_id = resp.json()["run_id"]
     await wait_for_run(client, run_id, {"completed", "failed"}, timeout=10.0)
@@ -372,7 +372,7 @@ async def test_three_step_separate_flow(client):
     # Step 2: Generate
     gen_resp = await client.post(
         f"{TR}/{run_id}/generate",
-        data={"generator": "local", "strategy": "minimal"},
+        data={"phase2_provider": "local", "strategy": "minimal"},
     )
     assert gen_resp.status_code == 202
     await wait_for_run(client, run_id, {"generated"})
@@ -390,6 +390,37 @@ async def test_three_step_separate_flow(client):
     results = (await client.get(f"{TR}/{run_id}/results")).json()
     assert isinstance(results["results"], list)
     assert len(results["results"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# format=md-failures endpoint
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_results_md_failures_returns_markdown(client):
+    """GET /results?format=md-failures returns text/markdown with correct filename."""
+    resp = await client.post(
+        f"{TR}/full-run",
+        files={"spec_file": ("openapi.yaml", SIMPLE_OPENAPI, "application/yaml")},
+        data={"target_base_url": "http://localhost:9999", "phase2_provider": "local"},
+    )
+    run_id = resp.json()["run_id"]
+    await wait_for_run(client, run_id, {"completed", "failed"}, timeout=10.0)
+
+    md_resp = await client.get(f"{TR}/{run_id}/results?format=md-failures")
+    assert md_resp.status_code == 200
+    assert "text/markdown" in md_resp.headers["content-type"]
+    assert f"failures-{run_id[:8]}.md" in md_resp.headers["content-disposition"]
+
+    body = md_resp.text
+    assert "# Failure Report" in body
+    assert "Run ID" in body
+
+
+@pytest.mark.asyncio
+async def test_results_md_failures_unknown_run_returns_404(client):
+    resp = await client.get(f"{TR}/nonexistent/results?format=md-failures")
+    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +473,7 @@ async def test_cancel_completed_run_returns_false(client):
     resp = await client.post(
         f"{TR}/full-run",
         files={"spec_file": ("openapi.yaml", SIMPLE_OPENAPI, "application/yaml")},
-        data={"target_base_url": "http://localhost:19999", "generator": "local"},
+        data={"target_base_url": "http://localhost:19999", "phase2_provider": "local"},
     )
     run_id = resp.json()["run_id"]
     await wait_for_run(client, run_id, {"completed", "failed"}, timeout=10.0)

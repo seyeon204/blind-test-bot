@@ -16,8 +16,47 @@ def _is_mock() -> bool:
     return settings.anthropic_api_key.lower().startswith("mock")
 
 
-def _use_claude_cli() -> bool:
-    return settings.llm_provider == "claude-cli"
+def _is_cli_provider(provider: str) -> bool:
+    """Return True for any subprocess-based CLI provider."""
+    return provider in ("claude-cli", "gemini-cli", "codex-cli")
+
+
+def _normalize_provider(provider: str) -> str:
+    """Normalize provider aliases to their canonical internal name."""
+    return "anthropic" if provider == "claude-api" else provider
+
+
+def _to_gemini_schema(schema: dict) -> dict:
+    """Recursively convert Anthropic JSON Schema to Gemini schema format."""
+    TYPE_MAP = {
+        "object": "OBJECT", "array": "ARRAY", "string": "STRING",
+        "integer": "INTEGER", "number": "NUMBER", "boolean": "BOOLEAN",
+    }
+    t = schema.get("type", "string")
+    result: dict = {"type": TYPE_MAP.get(t, "STRING")}
+    if "description" in schema:
+        result["description"] = schema["description"]
+    if t == "object":
+        if "properties" in schema:
+            result["properties"] = {k: _to_gemini_schema(v) for k, v in schema["properties"].items()}
+        if "required" in schema:
+            result["required"] = schema["required"]
+    elif t == "array" and "items" in schema:
+        result["items"] = _to_gemini_schema(schema["items"])
+    if "enum" in schema:
+        result["enum"] = schema["enum"]
+    return result
+
+
+def get_phase_provider(phase: str) -> str:
+    """Return the effective provider for a given phase.
+
+    Reads the per-phase override from settings; falls back to settings.llm_provider.
+    Phase names: 'phase0', 'phase1', 'phase2a', 'phase2b', 'phase3'
+    """
+    override = getattr(settings, f"{phase}_provider", "")
+    return override if override else settings.llm_provider
+
 
 
 def _mock_message(tool_name: str, input_data: dict):
@@ -147,20 +186,39 @@ async def chat_with_tools(
     cache_system: bool = False,
     skip_rate_limit: bool = False,
     max_tokens: int = 8192,
+    provider: str | None = None,
 ) -> anthropic.types.Message:
-    if _is_mock():
+    effective_provider = _normalize_provider(provider or settings.llm_provider)
+
+    # Only anthropic provider uses the Anthropic API key — skip mock mode for everything else.
+    if _is_mock() and effective_provider == "anthropic":
         tool_name = tool_choice["name"] if tool_choice else tools[0]["name"]
         logger.info("[claude_client] MOCK mode — returning stub for tool=%s", tool_name)
         return _mock_message(tool_name, _MOCK_RESPONSES.get(tool_name, {}))
 
-    if _use_claude_cli():
-        return await _chat_with_tools_cli(
-            system=system,
-            user=user,
-            tools=tools,
-            tool_choice=tool_choice,
-            max_retries=max_retries,
+    if effective_provider == "gemini-api":
+        return await _chat_with_tools_gemini_api(
+            system=system, user=user, tools=tools, tool_choice=tool_choice, max_retries=max_retries,
         )
+
+    if effective_provider == "codex-api":
+        return await _chat_with_tools_openai(
+            system=system, user=user, tools=tools, tool_choice=tool_choice, max_retries=max_retries,
+        )
+
+    if _is_cli_provider(effective_provider):
+        if effective_provider == "gemini-cli":
+            return await _chat_with_tools_gemini_cli(
+                system=system, user=user, tools=tools, tool_choice=tool_choice, max_retries=max_retries,
+            )
+        elif effective_provider == "codex-cli":
+            return await _chat_with_tools_codex_cli(
+                system=system, user=user, tools=tools, tool_choice=tool_choice, max_retries=max_retries,
+            )
+        else:  # claude-cli
+            return await _chat_with_tools_cli(
+                system=system, user=user, tools=tools, tool_choice=tool_choice, max_retries=max_retries,
+            )
 
     client = get_client()
     system_param: str | list = (
@@ -252,6 +310,259 @@ async def _chat_with_tools_cli(
     raise RuntimeError("unreachable")
 
 
+async def _chat_with_tools_gemini_cli(
+    system: str,
+    user: str,
+    tools: list[dict],
+    tool_choice: dict | None,
+    max_retries: int,
+) -> _types.SimpleNamespace:
+    """Gemini CLI subprocess adapter."""
+    tool_name = tool_choice["name"] if tool_choice else tools[0]["name"]
+    tool_def = next(t for t in tools if t["name"] == tool_name)
+    schema_str = json.dumps(tool_def["input_schema"], indent=2)
+
+    prompt = (
+        f"{system}\n\n"
+        f"{user}\n\n"
+        f"CRITICAL: Respond with ONLY a valid JSON object matching the schema below. "
+        f"No explanation, no markdown code blocks, no extra text — just raw JSON.\n\n"
+        f"Schema:\n{schema_str}"
+    )
+
+    import os
+    import time
+    env = dict(os.environ)
+
+    for attempt in range(max_retries):
+        try:
+            logger.info("[claude_client] gemini → tool=%s (attempt %d/%d) ...", tool_name, attempt + 1, max_retries)
+            t0 = time.monotonic()
+            proc = await asyncio.create_subprocess_exec(
+                "gemini", "-p", prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            elapsed = time.monotonic() - t0
+            text = stdout.decode().strip()
+
+            if proc.returncode != 0:
+                err = stderr.decode().strip()
+                raise RuntimeError(f"gemini exit code {proc.returncode}: {err[:200]}")
+
+            # Strip markdown code fences if present
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+
+            data = json.loads(text)
+            logger.info("[claude_client] gemini ✓ tool=%s (%.1fs)", tool_name, elapsed)
+            block = _types.SimpleNamespace(type="tool_use", name=tool_name, input=data)
+            return _types.SimpleNamespace(content=[block])
+
+        except (json.JSONDecodeError, asyncio.TimeoutError, Exception) as e:
+            if attempt == max_retries - 1:
+                logger.error("[claude_client] gemini ✗ tool=%s failed after %d attempts: %s", tool_name, max_retries, e)
+                raise
+            wait = 2 * (attempt + 1)
+            logger.warning("[claude_client] gemini tool=%s attempt %d/%d failed (%s), retry in %.0fs", tool_name, attempt + 1, max_retries, e, wait)
+            await asyncio.sleep(wait)
+    raise RuntimeError("unreachable")
+
+
+async def _chat_with_tools_codex_cli(
+    system: str,
+    user: str,
+    tools: list[dict],
+    tool_choice: dict | None,
+    max_retries: int,
+) -> _types.SimpleNamespace:
+    """Codex CLI subprocess adapter."""
+    tool_name = tool_choice["name"] if tool_choice else tools[0]["name"]
+    tool_def = next(t for t in tools if t["name"] == tool_name)
+    schema_str = json.dumps(tool_def["input_schema"], indent=2)
+
+    prompt = (
+        f"{system}\n\n"
+        f"{user}\n\n"
+        f"CRITICAL: Respond with ONLY a valid JSON object matching the schema below. "
+        f"No explanation, no markdown code blocks, no extra text — just raw JSON.\n\n"
+        f"Schema:\n{schema_str}"
+    )
+
+    import os
+    import time
+    env = dict(os.environ)
+
+    for attempt in range(max_retries):
+        try:
+            logger.info("[claude_client] codex → tool=%s (attempt %d/%d) ...", tool_name, attempt + 1, max_retries)
+            t0 = time.monotonic()
+            proc = await asyncio.create_subprocess_exec(
+                "codex", "--quiet", prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            elapsed = time.monotonic() - t0
+            text = stdout.decode().strip()
+
+            if proc.returncode != 0:
+                err = stderr.decode().strip()
+                raise RuntimeError(f"codex exit code {proc.returncode}: {err[:200]}")
+
+            # Strip markdown code fences if present
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+
+            data = json.loads(text)
+            logger.info("[claude_client] codex ✓ tool=%s (%.1fs)", tool_name, elapsed)
+            block = _types.SimpleNamespace(type="tool_use", name=tool_name, input=data)
+            return _types.SimpleNamespace(content=[block])
+
+        except (json.JSONDecodeError, asyncio.TimeoutError, Exception) as e:
+            if attempt == max_retries - 1:
+                logger.error("[claude_client] codex ✗ tool=%s failed after %d attempts: %s", tool_name, max_retries, e)
+                raise
+            wait = 2 * (attempt + 1)
+            logger.warning("[claude_client] codex tool=%s attempt %d/%d failed (%s), retry in %.0fs", tool_name, attempt + 1, max_retries, e, wait)
+            await asyncio.sleep(wait)
+    raise RuntimeError("unreachable")
+
+
+async def _chat_with_tools_openai(
+    system: str,
+    user: str,
+    tools: list[dict],
+    tool_choice: dict | None,
+    max_retries: int,
+) -> _types.SimpleNamespace:
+    """OpenAI API adapter — uses CODEX_API_KEY, supports GPT-4o / gpt-4o-mini."""
+    import time
+    from openai import AsyncOpenAI
+
+    tool_name = tool_choice["name"] if tool_choice else tools[0]["name"]
+    tool_def = next(t for t in tools if t["name"] == tool_name)
+
+    client = AsyncOpenAI(api_key=settings.codex_api_key)
+
+    openai_tool = {
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": tool_def.get("description", ""),
+            "parameters": tool_def["input_schema"],
+        },
+    }
+
+    for attempt in range(max_retries):
+        try:
+            logger.info("[claude_client] codex-api → tool=%s (attempt %d/%d) ...", tool_name, attempt + 1, max_retries)
+            t0 = time.monotonic()
+            response = await client.chat.completions.create(
+                model=settings.codex_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                tools=[openai_tool],
+                tool_choice={"type": "function", "function": {"name": tool_name}},
+            )
+            elapsed = time.monotonic() - t0
+
+            choice = response.choices[0]
+            tool_calls = getattr(choice.message, "tool_calls", None)
+            if not tool_calls:
+                raise RuntimeError("No tool_calls in OpenAI response")
+
+            data = json.loads(tool_calls[0].function.arguments)
+            logger.info("[claude_client] codex-api ✓ tool=%s (%.1fs)", tool_name, elapsed)
+            block = _types.SimpleNamespace(type="tool_use", name=tool_name, input=data)
+            return _types.SimpleNamespace(content=[block])
+
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.error("[claude_client] codex-api ✗ tool=%s failed after %d attempts: %s", tool_name, max_retries, e)
+                raise
+            wait = 2 * (attempt + 1)
+            logger.warning("[claude_client] codex-api tool=%s attempt %d/%d failed (%s), retry in %.0fs", tool_name, attempt + 1, max_retries, e, wait)
+            await asyncio.sleep(wait)
+    raise RuntimeError("unreachable")
+
+
+async def _chat_with_tools_gemini_api(
+    system: str,
+    user: str,
+    tools: list[dict],
+    tool_choice: dict | None,
+    max_retries: int,
+) -> _types.SimpleNamespace:
+    """Gemini API direct call — uses GEMINI_API_KEY, no subprocess."""
+    import time
+    from google import genai
+    from google.genai import types as gtypes
+
+    tool_name = tool_choice["name"] if tool_choice else tools[0]["name"]
+    tool_def = next(t for t in tools if t["name"] == tool_name)
+
+    client = genai.Client(api_key=settings.gemini_api_key)
+
+    func_decl = gtypes.FunctionDeclaration(
+        name=tool_name,
+        description=tool_def.get("description", ""),
+        parameters=_to_gemini_schema(tool_def["input_schema"]),
+    )
+    config = gtypes.GenerateContentConfig(
+        system_instruction=system,
+        tools=[gtypes.Tool(function_declarations=[func_decl])],
+        tool_config=gtypes.ToolConfig(
+            function_calling_config=gtypes.FunctionCallingConfig(
+                mode="ANY",
+                allowed_function_names=[tool_name],
+            )
+        ),
+    )
+
+    for attempt in range(max_retries):
+        try:
+            logger.info("[claude_client] gemini-api → tool=%s (attempt %d/%d) ...", tool_name, attempt + 1, max_retries)
+            t0 = time.monotonic()
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=settings.gemini_model,
+                    contents=user,
+                    config=config,
+                ),
+                timeout=120.0,
+            )
+            elapsed = time.monotonic() - t0
+
+            candidate = response.candidates[0] if response.candidates else None
+            if candidate is None or candidate.content is None:
+                finish = getattr(candidate, "finish_reason", "unknown") if candidate else "no candidates"
+                raise RuntimeError(f"Empty response content (finish_reason={finish})")
+
+            for part in candidate.content.parts:
+                if part.function_call is not None:
+                    data = dict(part.function_call.args)
+                    logger.info("[claude_client] gemini-api ✓ tool=%s (%.1fs)", tool_name, elapsed)
+                    block = _types.SimpleNamespace(type="tool_use", name=tool_name, input=data)
+                    return _types.SimpleNamespace(content=[block])
+
+            raise RuntimeError("No function call in response")
+
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.error("[claude_client] gemini-api ✗ tool=%s failed after %d attempts: %s", tool_name, max_retries, e)
+                raise
+            wait = 2 * (attempt + 1)
+            logger.warning("[claude_client] gemini-api tool=%s attempt %d/%d failed (%s), retry in %.0fs", tool_name, attempt + 1, max_retries, e, wait)
+            await asyncio.sleep(wait)
+    raise RuntimeError("unreachable")
+
+
 async def chat_with_tools_pdf(
     pdf_bytes: bytes,
     system: str,
@@ -259,6 +570,7 @@ async def chat_with_tools_pdf(
     tool_choice: dict | None = None,
     max_retries: int = 5,
     cache_system: bool = False,
+    provider: str | None = None,
 ) -> anthropic.types.Message:
     """Like chat_with_tools but sends a PDF as a native document content block."""
     if _is_mock():
@@ -266,7 +578,8 @@ async def chat_with_tools_pdf(
         logger.info("[claude_client] MOCK mode — returning stub for tool=%s (pdf)", tool_name)
         return _mock_message(tool_name, _MOCK_RESPONSES.get(tool_name, {}))
 
-    if _use_claude_cli():
+    effective_provider = _normalize_provider(provider or settings.llm_provider)
+    if _is_cli_provider(effective_provider):
         raise NotImplementedError(
             "chat_with_tools_pdf should not be called in CLI mode — "
             "document_parser handles PDF via pypdf text extraction."

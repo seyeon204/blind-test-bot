@@ -7,7 +7,7 @@ import logging
 
 from app.config import settings
 from app.models.internal import ExecutionResult, TestCase, ValidationResult
-from app.utils.claude_client import chat_with_tools
+from app.utils.claude_client import chat_with_tools, get_phase_provider, _is_cli_provider
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,7 @@ _SYSTEM = """You are a senior QA engineer evaluating API test results. For each 
 - 401 ≈ 403 for auth checks (both indicate the endpoint is protected).
 - 201 / 202 / 204 count as 2xx success.
 - If the test description says "should return X" but received Y and Y is semantically equivalent, use your judgement.
+- **Application-level error codes**: Some APIs always return HTTP 200 and encode success/failure in the response body (e.g. `{"code": 1401, "errorCode": "BOOTSTRAP_REQUEST_UNAUTHORIZED"}`). If the body contains a non-success application code (non-zero `code`, or a non-null `errorCode`/`error` field indicating rejection), treat it as semantically equivalent to a 4xx response when evaluating negative tests and auth checks.
 
 ## Reasoning requirement
 For every test case, reason step-by-step (intent → expectation → actual → verdict) in the `reasoning` field **before** setting `passed`. This prevents snap judgements on ambiguous cases."""
@@ -121,6 +122,7 @@ async def _validate_subset(
     test_cases: list[TestCase],
     exec_map: dict[str, ExecutionResult],
     effective_model: str,
+    provider: str = "anthropic",
 ) -> list[ValidationResult]:
     """Send one Claude call for a homogeneous subset (security OR functional) and
     return ValidationResult list. Falls back to heuristic on any error.
@@ -154,6 +156,7 @@ async def _validate_subset(
                 thinking=thinking,
                 cache_system=True,
                 skip_rate_limit=True,
+                provider=provider,
             ),
             timeout=settings.ai_validate_timeout_seconds,
         )
@@ -195,6 +198,7 @@ async def ai_validate_batch(
     test_cases: list[TestCase],
     executions: list[ExecutionResult],
     model: str | None = None,
+    provider: str | None = None,
 ) -> list[ValidationResult]:
     """Use Claude to judge pass/fail for a batch of execution results.
 
@@ -213,6 +217,11 @@ async def ai_validate_batch(
 
     exec_map = {e.test_case_id: e for e in executions}
     effective_model = model or settings.claude_tc_model
+    effective_provider = provider or get_phase_provider("phase3")
+
+    # "local" provider: skip AI validation entirely, fall back to heuristic
+    if effective_provider == "local":
+        return _heuristic_fallback(test_cases, exec_map)
 
     if effective_model in _ADAPTIVE_THINKING_MODELS:
         logger.debug("[ai_validator] enabling adaptive thinking for model=%s", effective_model)
@@ -237,9 +246,9 @@ async def ai_validate_batch(
     functional_tcs = [tc for tc in claude_tcs if not tc.security_test_type]
 
     if functional_tcs:
-        results.extend(await _validate_subset(functional_tcs, exec_map, effective_model))
+        results.extend(await _validate_subset(functional_tcs, exec_map, effective_model, provider=effective_provider))
     if security_tcs:
-        results.extend(await _validate_subset(security_tcs, exec_map, effective_model))
+        results.extend(await _validate_subset(security_tcs, exec_map, effective_model, provider=effective_provider))
 
     return results
 

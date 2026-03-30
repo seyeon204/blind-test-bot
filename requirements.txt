@@ -9,3 +9,5 @@ jsonschema>=4.22.0
 python-multipart>=0.0.9
 pypdf>=4.0.0
 pytest-httpserver>=1.1.0
+google-genai>=1.0.0
+openai>=1.0.0

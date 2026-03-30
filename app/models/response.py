@@ -62,6 +62,7 @@ class TestCaseResultResponse(BaseModel):
     failures: list[str]
     reasoning: Optional[str] = None  # AI chain-of-thought explanation; None when heuristic fallback was used
     validation_mode: str = "heuristic"
+    security_test_type: Optional[str] = None
 
 
 RunStatus = Literal[

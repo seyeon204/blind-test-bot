@@ -213,7 +213,7 @@ async def _run_pipeline(client, httpserver) -> tuple[str, list[dict]]:
         files={"spec_file": ("openapi.yaml", SPEC, "application/yaml")},
         data={
             "target_base_url": base_url,
-            "generator": "local",
+            "phase2_provider": "local",
             "strategy": "standard",
         },
     )
